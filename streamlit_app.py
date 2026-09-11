@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
 
-from component_checker import build_report_rows
+from component_checker import build_report_rows, clean_BOM
 from Pricing import Update_Price_Stock
 from Pricing import build_pricing_report  # ou le nom du fichier où tu as mis cette fonction
-
+from session_state import afficher_matching_interactif
 st.set_page_config(page_title="BOM Checker", layout="wide")
 st.title("Vérification BOM / Bibliothèque de composants")
 
@@ -64,3 +64,16 @@ with onglet_pricing:
 
         st.subheader("Détail complet")
         st.dataframe(report, use_container_width=True)
+
+
+with onglet_matching:
+    if fichier_bom is not None:
+        BOM = clean_BOM(fichier_bom)
+        library = pd.read_excel(chemin_lib, sheet_name=nom_feuille)
+
+        choix = afficher_matching_interactif(BOM, library)
+
+        if st.button("Valider les choix et passer au pricing"):
+            st.session_state.bom_valide = BOM
+            st.session_state.choix_valides = choix
+            st.success(f"{len(choix)}/{len(BOM)} lignes associées.")
