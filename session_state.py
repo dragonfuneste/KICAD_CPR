@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
-
+from component_checker import build_report_rows, clean_BOM
 from find_component import find_by_row, find_by_keyword
-
+from Pricing import Update_Price_Stock
+from Pricing import build_pricing_report  # ou le nom du fichier où tu as mis cette fonction
 
 def afficher_matching_interactif(BOM, library):
     """
