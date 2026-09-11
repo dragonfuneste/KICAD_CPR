@@ -1,25 +1,44 @@
 import streamlit as st
 import pandas as pd
-from component_checker import build_report_rows, clean_BOM
-from find_component import find_by_row, find_by_keyword
-from Pricing import Update_Price_Stock
-from Pricing import build_pricing_report  # ou le nom du fichier où tu as mis cette fonction
 
-import streamlit as st
-import pandas as pd
+from find_component import find_by_row, extraire_empreinte  # si extraire_empreinte existe encore dans ton module
 
-from find_component import find_by_row
+
+def _fusion_bom(row):
+    """Fusionne Description + Value + empreinte d'une ligne BOM."""
+    morceaux = []
+    if pd.notna(row.get("Description")):
+        morceaux.append(str(row["Description"]))
+    if pd.notna(row.get("Value")):
+        morceaux.append(str(row["Value"]))
+    if pd.notna(row.get("empreinte")):
+        morceaux.append(str(row["empreinte"]))
+    return " | ".join(morceaux)
+
+def _fusion_lib(lib_row):
+    """Fusionne nom du composant + type + specification + empreinte d'une ligne bibliothèque."""
+    morceaux = []
+    for champ in ["nom du composant", "type", "specification", "empreinte"]:
+        val = lib_row.get(champ)
+        if pd.notna(val):
+            morceaux.append(str(val))
+    return " | ".join(morceaux)
 
 
 def afficher_matching_tableau(BOM, library):
     """
-    Affiche le matching du BOM sous forme de tableau éditable :
-    une ligne par composant du BOM, les candidats proposés en texte,
-    et une colonne déroulante pour choisir/corriger le composant final.
-
-    Retourne le DataFrame édité (avec la colonne 'Composant choisi' à jour).
+    Tableau de matching : colonne 'Infos BOM' (Description+Value+empreinte fusionnés),
+    et colonne 'Composant choisi' avec les candidats affichés en version fusionnée
+    (nom+type+specification+empreinte) pour être lisible sans deviner.
     """
-    tous_les_composants = sorted(library["nom du composant"].dropna().unique().tolist())
+    label_vers_nom = {}
+    for _, lib_row in library.iterrows():
+        if pd.isna(lib_row.get("nom du composant")):
+            continue
+        label = _fusion_lib(lib_row)
+        label_vers_nom[label] = lib_row["nom du composant"]
+
+    tous_les_labels = sorted(label_vers_nom.keys())
 
     lignes = []
     for index, row in BOM.iterrows():
@@ -27,24 +46,19 @@ def afficher_matching_tableau(BOM, library):
 
         if isinstance(resultat, pd.Series):
             statut = "trouvé"
-            candidats_txt = resultat["nom du composant"]
-            choix_par_defaut = resultat["nom du composant"]
+            label_defaut = _fusion_lib(resultat)
         elif isinstance(resultat, pd.DataFrame):
             statut = "plusieurs candidats"
-            candidats_txt = " | ".join(resultat["nom du composant"].tolist())
-            choix_par_defaut = resultat.iloc[0]["nom du composant"]
+            label_defaut = _fusion_lib(resultat.iloc[0])
         else:
             statut = "aucune correspondance"
-            candidats_txt = ""
-            choix_par_defaut = None
+            label_defaut = None
 
         lignes.append({
             "Ligne": index + 1,
-            "Manufacturer Ref": row.get("Manufacturer Ref", ""),
-            "Description": row.get("Description", ""),
+            "📋 Infos BOM (Description | Value | Empreinte)": _fusion_bom(row),
             "Statut": statut,
-            "Candidats proposés": candidats_txt,
-            "Composant choisi": choix_par_defaut,
+            "🎯 Composant choisi (nom | type | spec | empreinte)": label_defaut,
         })
 
     df = pd.DataFrame(lignes)
@@ -52,18 +66,27 @@ def afficher_matching_tableau(BOM, library):
     df_edite = st.data_editor(
         df,
         column_config={
-            "Composant choisi": st.column_config.SelectboxColumn(
-                "Composant choisi",
+            "🎯 Composant choisi (nom | type | spec | empreinte)": st.column_config.SelectboxColumn(
+                "🎯 Composant choisi (nom | type | spec | empreinte)",
                 help="Tape pour rechercher dans toute la bibliothèque",
-                options=tous_les_composants,
+                options=tous_les_labels,
                 required=False,
+                width="large",
+            ),
+            "📋 Infos BOM (Description | Value | Empreinte)": st.column_config.TextColumn(
+                "📋 Infos BOM (Description | Value | Empreinte)", disabled=True, width="large"
             ),
             "Statut": st.column_config.TextColumn("Statut", disabled=True),
         },
-        disabled=["Ligne", "Manufacturer Ref", "Description", "Candidats proposés"],
+        disabled=["Ligne"],
         use_container_width=True,
         hide_index=True,
         key="editeur_matching",
     )
+
+    # on reconvertit les libellés choisis en vrais noms de composant pour la suite (pricing, etc.)
+    df_edite["Composant (nom réel)"] = df_edite[
+        "🎯 Composant choisi (nom | type | spec | empreinte)"
+    ].map(label_vers_nom)
 
     return df_edite
