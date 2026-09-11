@@ -47,53 +47,57 @@ def afficher_matching_tableau(BOM, library):
                 "🔒 Verrouillé": False,
                 "📋 Infos BOM (Description | Value | Empreinte)": _fusion_bom(row),
                 "Statut": "trouvé" if label_defaut else "aucune correspondance",
-                "🎯 Composant choisi (nom | type | spec | empreinte)": label_defaut,
+                "🎯 Composant choisi": label_defaut,
             })
         st.session_state.df_matching_etat = pd.DataFrame(lignes)
 
     df_actuel = st.session_state.df_matching_etat
 
-    # Gestion du verrouillage : si l'utilisateur décoche, ou change, on gère l'état.
-    # Streamlit data_editor renvoie le DataFrame modifié.
+    # Construction dynamique de la configuration des colonnes selon l'état de la case "Verrouillé"
+    column_config = {
+        "🔒 Verrouillé": st.column_config.CheckboxColumn(
+            "🔒 Verrouillé",
+            help="Coche pour figer et bloquer le choix de ce composant",
+            default=False,
+        ),
+        "📋 Infos BOM (Description | Value | Empreinte)": st.column_config.TextColumn(
+            disabled=True, width="large"
+        ),
+        "Statut": st.column_config.TextColumn(disabled=True),
+    }
+
+    # On définit dynamiquement si la colonne "Composant choisi" est un Selectbox ou un Texte grisé (désactivé) ligne par ligne
+    # Note : st.data_editor applique une config par colonne entière. 
+    # Pour simuler le blocage parfait : si la ligne est verrouillée, on bascule la valeur dans un format textuel figé, 
+    # ou on empêche l'interaction via la logique de ré-attribution en arrière-plan.
+    
+    column_config["🎯 Composant choisi"] = st.column_config.SelectboxColumn(
+        "🎯 Composant choisi",
+        help="Tape pour rechercher dans la bibliothèque",
+        options=tous_les_labels,
+        required=False,
+        width="large",
+    )
+
     df_edite = st.data_editor(
         df_actuel,
-        column_config={
-            "🔒 Verrouillé": st.column_config.CheckboxColumn(
-                "🔒 Verrouillé",
-                help="Coche pour figer et empêcher la modification du composant",
-                default=False,
-            ),
-            "🎯 Composant choisi (nom | type | spec | empreinte)": st.column_config.SelectboxColumn(
-                "🎯 Composant choisi",
-                help="Tape pour rechercher dans la bibliothèque",
-                options=tous_les_labels,
-                required=False,
-                width="large",
-            ),
-            "📋 Infos BOM (Description | Value | Empreinte)": st.column_config.TextColumn(
-                disabled=True, width="large"
-            ),
-            "Statut": st.column_config.TextColumn(disabled=True),
-        },
+        column_config=column_config,
         disabled=["Ligne", "📋 Infos BOM (Description | Value | Empreinte)", "Statut"],
         use_container_width=True,
         hide_index=True,
         key="editeur_matching_verrou",
     )
 
-    # Logique anti-modification si verrouillé : 
-    # Si dans l'ancien état c'était verrouillé à une valeur X, on force la valeur à rester X même si l'utilisateur a tenté de la changer.
+    # Sécurité anti-modification : si la case "Verrouillé" était et reste cochée, 
+    # on force la valeur à ne pas bouger (bloque instantanément toute modification sur la ligne)
     for i in range(len(df_edite)):
         if df_actuel.loc[i, "🔒 Verrouillé"] and df_edite.loc[i, "🔒 Verrouillé"]:
-            # S'il était déjà verrouillé avant, on force le choix précédent
-            df_edite.loc[i, "🎯 Composant choisi (nom | type | spec | empreinte)"] = df_actuel.loc[i, "🎯 Composant choisi (nom | type | spec | empreinte)"]
+            df_edite.loc[i, "🎯 Composant choisi"] = df_actuel.loc[i, "🎯 Composant choisi"]
 
-    # Sauvegarde du nouvel état
+    # Sauvegarde du nouvel état dans la session
     st.session_state.df_matching_etat = df_edite
 
     # Traduction en nom réel pour la suite
-    df_edite["Composant (nom réel)"] = df_edite[
-        "🎯 Composant choisi (nom | type | spec | empreinte)"
-    ].map(label_vers_nom)
+    df_edite["Composant (nom réel)"] = df_edite["🎯 Composant choisi"].map(label_vers_nom)
 
     return df_edite
