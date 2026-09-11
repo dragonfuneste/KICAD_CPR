@@ -29,16 +29,7 @@ with onglet_maj:
             Update_Price_Stock(chemin_lib, nom_feuille)
         st.success("Bibliothèque mise à jour.")
 
-with onglet_matching:
-    if fichier_bom is not None and st.button("Lancer le matching"):
-        with st.spinner("Analyse en cours..."):
-            report = build_report_rows(fichier_bom, chemin_lib)
-        st.dataframe(report, use_container_width=True)
-        st.download_button(
-            "Télécharger le rapport",
-            report.to_csv(index=False).encode("utf-8"),
-            "rapport_matching.csv",
-        )
+
 
 with onglet_pricing:
     if fichier_bom is not None and st.button("Calculer le pricing"):
