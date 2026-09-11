@@ -92,3 +92,45 @@ def find_by_row(library, bom_row, bom_fields=None, lib_fields=None, threshold=0.
 
     logger.info("plusieurs résultats trouvés")
     return result
+
+
+
+
+def find_by_keyword(library, keyword, fields=None, threshold=0.35):
+    """
+    Recherche un mot-clef unique dans plusieurs champs de la bibliothèque
+    (contrairement à find_by_row qui utilise toute une ligne de BOM).
+    Retourne None / Series / DataFrame, comme find_by_row.
+    """
+    fields = fields or ["nom du composant", "type", "specification", "empreinte"]
+    fields = [f for f in fields if f in library.columns]
+    keyword_norm = str(keyword).strip().lower()
+    if not keyword_norm:
+        return None
+
+    scores = []
+    for _, row in library.iterrows():
+        best_field_score = 0.0
+        for f in fields:
+            val = row.get(f)
+            if pd.isna(val):
+                continue
+            val_norm = str(val).strip().lower()
+            best_field_score = max(best_field_score, _score_champ(keyword_norm, val_norm, f))
+        scores.append(best_field_score)
+
+    result = library.copy()
+    result["__score"] = scores
+    result = result[result["__score"] >= threshold].sort_values("__score", ascending=False)
+
+    if result.empty:
+        return None
+    if len(result) == 1:
+        return result.iloc[0]
+
+    top_score = result.iloc[0]["__score"]
+    second_score = result.iloc[1]["__score"]
+    if top_score - second_score >= 0.05 or top_score == 1.0:
+        return result.iloc[0]
+
+    return result
