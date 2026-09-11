@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 
-from find_component import find_by_row, extraire_empreinte  # si extraire_empreinte existe encore dans ton module
+from find_component import find_by_row  # si extraire_empreinte existe encore dans ton module
 
 
 def _fusion_bom(row):
