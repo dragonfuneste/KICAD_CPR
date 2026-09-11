@@ -4,7 +4,7 @@ import pandas as pd
 from component_checker import build_report_rows, clean_BOM
 from Pricing import Update_Price_Stock
 from Pricing import build_pricing_report  # ou le nom du fichier où tu as mis cette fonction
-from session_state import afficher_matching_interactif
+from session_state import afficher_matching_tableau
 st.set_page_config(page_title="BOM Checker", layout="wide")
 st.title("Vérification BOM / Bibliothèque de composants")
 
@@ -71,9 +71,9 @@ with onglet_matching:
         BOM = clean_BOM(fichier_bom)
         library = pd.read_excel(chemin_lib, sheet_name=nom_feuille)
 
-        choix = afficher_matching_interactif(BOM, library)
+        df_matching = afficher_matching_tableau(BOM, library)
 
         if st.button("Valider les choix et passer au pricing"):
             st.session_state.bom_valide = BOM
-            st.session_state.choix_valides = choix
-            st.success(f"{len(choix)}/{len(BOM)} lignes associées.")
+            st.session_state.choix_valides = dict(zip(df_matching["Ligne"] - 1, df_matching["Composant choisi"]))
+            st.success(f"{df_matching['Composant choisi'].notna().sum()}/{len(BOM)} lignes associées.")

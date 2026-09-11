@@ -5,58 +5,65 @@ from find_component import find_by_row, find_by_keyword
 from Pricing import Update_Price_Stock
 from Pricing import build_pricing_report  # ou le nom du fichier où tu as mis cette fonction
 
-def afficher_matching_interactif(BOM, library):
-    """
-    Affiche le BOM ligne par ligne. Pour chaque ligne sans match fiable,
-    propose un menu déroulant des candidats + une recherche manuelle.
-    Retourne un dict {index_ligne_BOM: nom_du_composant_choisi}.
-    """
-    if "choix_matching" not in st.session_state:
-        st.session_state.choix_matching = {}
+import streamlit as st
+import pandas as pd
 
+from find_component import find_by_row
+
+
+def afficher_matching_tableau(BOM, library):
+    """
+    Affiche le matching du BOM sous forme de tableau éditable :
+    une ligne par composant du BOM, les candidats proposés en texte,
+    et une colonne déroulante pour choisir/corriger le composant final.
+
+    Retourne le DataFrame édité (avec la colonne 'Composant choisi' à jour).
+    """
+    tous_les_composants = sorted(library["nom du composant"].dropna().unique().tolist())
+
+    lignes = []
     for index, row in BOM.iterrows():
         resultat = find_by_row(library, row)
-        libelle = row.get("Manufacturer Ref") or row.get("Description") or f"Ligne {index + 1}"
 
-        # cas 1 : match unique et fiable -> affiché en lecture seule, pas d'intervention
         if isinstance(resultat, pd.Series):
-            st.session_state.choix_matching[index] = resultat["nom du composant"]
-            st.markdown(f"✅ **Ligne {index + 1}** ({libelle}) → `{resultat['nom du composant']}`")
-            continue
+            statut = "trouvé"
+            candidats_txt = resultat["nom du composant"]
+            choix_par_defaut = resultat["nom du composant"]
+        elif isinstance(resultat, pd.DataFrame):
+            statut = "plusieurs candidats"
+            candidats_txt = " | ".join(resultat["nom du composant"].tolist())
+            choix_par_defaut = resultat.iloc[0]["nom du composant"]
+        else:
+            statut = "aucune correspondance"
+            candidats_txt = ""
+            choix_par_defaut = None
 
-        # cas 2 : plusieurs candidats ou aucun -> on demande à l'utilisateur
-        candidats = resultat["nom du composant"].tolist() if isinstance(resultat, pd.DataFrame) else []
+        lignes.append({
+            "Ligne": index + 1,
+            "Manufacturer Ref": row.get("Manufacturer Ref", ""),
+            "Description": row.get("Description", ""),
+            "Statut": statut,
+            "Candidats proposés": candidats_txt,
+            "Composant choisi": choix_par_defaut,
+        })
 
-        with st.expander(f"⚠️ Ligne {index + 1} — {libelle} (à valider)", expanded=True):
-            options = ["-- à définir --"] + candidats + ["🔍 Recherche manuelle..."]
-            choix = st.selectbox(
-                "Composant à associer",
-                options,
-                key=f"select_{index}",
-            )
+    df = pd.DataFrame(lignes)
 
-            if choix == "🔍 Recherche manuelle...":
-                terme = st.text_input("Rechercher dans la bibliothèque", key=f"recherche_{index}")
-                if terme:
-                    resultat_recherche = find_by_keyword(library, terme)
+    df_edite = st.data_editor(
+        df,
+        column_config={
+            "Composant choisi": st.column_config.SelectboxColumn(
+                "Composant choisi",
+                help="Tape pour rechercher dans toute la bibliothèque",
+                options=tous_les_composants,
+                required=False,
+            ),
+            "Statut": st.column_config.TextColumn("Statut", disabled=True),
+        },
+        disabled=["Ligne", "Manufacturer Ref", "Description", "Candidats proposés"],
+        use_container_width=True,
+        hide_index=True,
+        key="editeur_matching",
+    )
 
-                    if isinstance(resultat_recherche, pd.DataFrame):
-                        choix_manuel = st.selectbox(
-                            "Résultats trouvés",
-                            resultat_recherche["nom du composant"].tolist(),
-                            key=f"manuel_{index}",
-                        )
-                        st.session_state.choix_matching[index] = choix_manuel
-                    elif isinstance(resultat_recherche, pd.Series):
-                        st.session_state.choix_matching[index] = resultat_recherche["nom du composant"]
-                        st.info(f"Trouvé : {resultat_recherche['nom du composant']}")
-                    else:
-                        st.warning("Rien trouvé pour ce terme.")
-                        st.session_state.choix_matching.pop(index, None)
-
-            elif choix != "-- à définir --":
-                st.session_state.choix_matching[index] = choix
-            else:
-                st.session_state.choix_matching.pop(index, None)
-
-    return st.session_state.choix_matching
+    return df_edite
