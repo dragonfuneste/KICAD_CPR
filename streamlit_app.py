@@ -24,6 +24,10 @@ from backend.BOM_report import build_bom_report, export_report_excel
 
 st.set_page_config(page_title="BOM Checker", page_icon="🔧", layout="wide")
 
+# Librairie par défaut embarquée dans le repo (à côté de streamlit_app.py).
+# L'utilisateur peut la remplacer via l'upload ci-dessous.
+DEFAULT_LIB_PATH = Path(__file__).parent / "Component_library.xlsx"
+
 
 # ============================================================
 # Utilitaires
@@ -85,19 +89,35 @@ col1, col2 = st.columns(2)
 
 with col1:
     bom_file = st.file_uploader("BOM (.xlsx)", type=["xlsx"])
-    header_row = st.number_input(
-        "Ligne d'en-tête du BOM (0 = première ligne)",
-        min_value=0, max_value=50, value=7,
-        help="Nombre de lignes de titre/logo avant les en-têtes de colonnes. "
-             "7 pour un export KiCad classique (comme Carte_radar_V0.2--BoM.xlsx).",
-    )
+    header_row = 7
 
 with col2:
-    lib_file = st.file_uploader("Librairie de composants (.xlsx)", type=["xlsx"])
+    lib_file = st.file_uploader(
+        "Librairie de composants (.xlsx) — optionnel",
+        type=["xlsx"],
+        help="Par défaut, la librairie du projet (Component_library.xlsx) est utilisée. "
+             "Charge un fichier ici pour la remplacer.",
+    )
 
-if bom_file is not None and lib_file is not None:
+if bom_file is not None:
 
-    lib_path = _save_uploaded_file(lib_file, st.session_state.workdir)
+    if lib_file is not None:
+        lib_path = _save_uploaded_file(lib_file, st.session_state.workdir)
+        st.caption(f"📚 Librairie utilisée : **{lib_file.name}** (chargée)")
+    elif DEFAULT_LIB_PATH.exists():
+        # On copie la lib par défaut dans le workdir pour ne jamais modifier
+        # le fichier du repo (Update_Price_Stock écrit dans le fichier).
+        lib_path = st.session_state.workdir / DEFAULT_LIB_PATH.name
+        if not lib_path.exists():
+            lib_path.write_bytes(DEFAULT_LIB_PATH.read_bytes())
+        st.caption(f"📚 Librairie utilisée : **{DEFAULT_LIB_PATH.name}** (par défaut, celle du projet)")
+    else:
+        st.error(
+            f"Aucune librairie chargée et {DEFAULT_LIB_PATH.name} introuvable dans le projet. "
+            "Charge un fichier librairie."
+        )
+        st.stop()
+
     st.session_state.lib_path = lib_path
 
     try:

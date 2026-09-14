@@ -1,12 +1,7 @@
 """
-Fonction qui donne un rapport finale sur le BOM en donnant le prix pour n pcb des composants, les composants qui ne sont pas complet ou pas détecter
-
-"""
-
-
-"""
 Fonction qui donne un rapport final sur le BOM : prix pour n PCB des
-composants, et liste des composants incomplets ou non détectés.
+composants, composants incomplets/non détectés, et analyses (composant le
+plus cher, coût par famille, composants les plus récurrents).
 """
 
 import pandas as pd
@@ -35,7 +30,7 @@ def _get_status(row):
     return "OK"
 
 
-def build_bom_report(bom, lib, n_pcb=1, quantity_column=None):
+def build_bom_report(bom, lib, n_pcb=1, quantity_column=None, top_n=10):
     """
     Construit un rapport BOM.
 
@@ -43,17 +38,22 @@ def build_bom_report(bom, lib, n_pcb=1, quantity_column=None):
     ----------
     bom : DataFrame du BOM (avec LCSC_part_number, Comments, etc.)
     lib : DataFrame de la librairie RELUE APRES Update_Price_Stock
-          (doit contenir reference_LCSC, Price, Stock website)
+          (doit contenir reference_LCSC, Price, Stock website, idéalement 'type')
     n_pcb : nombre de PCB pour lesquels calculer le prix total
     quantity_column : nom de la colonne "quantité par PCB" dans le BOM.
                        Si None, détection automatique (voir _get_quantity_column).
+    top_n : nombre de lignes à garder dans les classements (composants les
+            plus chers / les plus récurrents).
 
     Returns
     -------
     dict avec :
-        "detail"      : DataFrame ligne par ligne (prix unitaire, prix total, statut)
-        "missing"     : DataFrame des composants incomplets / non détectés / à vérifier
-        "total_price" : prix total du BOM pour n_pcb (EUR)
+        "detail"          : DataFrame ligne par ligne (prix unitaire, prix total, statut)
+        "missing"         : DataFrame des composants incomplets / non détectés / à vérifier
+        "total_price"     : prix total du BOM pour n_pcb (EUR)
+        "top_expensive"   : DataFrame des composants les plus chers (Line_total_price)
+        "cost_by_type"    : Series du coût total par famille ("type"), triée décroissant
+        "most_recurring"  : DataFrame des composants les plus utilisés (par quantité totale)
     """
 
     bom = bom.copy()
@@ -62,13 +62,13 @@ def build_bom_report(bom, lib, n_pcb=1, quantity_column=None):
         quantity_column = _get_quantity_column(bom)
 
     # ------------------------------------------------------------
-    # Jointure avec la librairie pour récupérer Price / Stock
+    # Jointure avec la librairie pour récupérer Price / Stock / type
     # ------------------------------------------------------------
-    colonnes_lib = [c for c in ["reference_LCSC", "Price", "Stock website"] if c in lib.columns]
-    lib_prices = lib[colonnes_lib].drop_duplicates(subset="reference_LCSC")
+    colonnes_lib = [c for c in ["reference_LCSC", "Price", "Stock website", "type"] if c in lib.columns]
+    lib_infos = lib[colonnes_lib].drop_duplicates(subset="reference_LCSC")
 
     merged = bom.merge(
-        lib_prices,
+        lib_infos,
         left_on="LCSC_part_number",
         right_on="reference_LCSC",
         how="left",
@@ -96,10 +96,61 @@ def build_bom_report(bom, lib, n_pcb=1, quantity_column=None):
     missing = merged[merged["Status"] != "OK"].copy()
     total_price = merged["Line_total_price"].sum(skipna=True)
 
+    # ------------------------------------------------------------
+    # Composants les plus chers (pour n_pcb)
+    # ------------------------------------------------------------
+    cols_expensive = [c for c in [
+        "Manufacturer Ref", "Value", "Footprint", "type",
+        "Qty_total", "Unit_price", "Line_total_price",
+    ] if c in merged.columns]
+
+    top_expensive = (
+        merged.dropna(subset=["Line_total_price"])
+        .sort_values("Line_total_price", ascending=False)
+        [cols_expensive]
+        .head(top_n)
+    )
+
+    # ------------------------------------------------------------
+    # Coût total par famille de composant ("type" : Resistor, Capacitor...)
+    # ------------------------------------------------------------
+    if "type" in merged.columns:
+        cost_by_type = (
+            merged.dropna(subset=["Line_total_price"])
+            .groupby("type")["Line_total_price"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+    else:
+        cost_by_type = None
+
+    # ------------------------------------------------------------
+    # Composants les plus récurrents (par quantité totale utilisée)
+    # ------------------------------------------------------------
+    ref_col = "Manufacturer Ref" if "Manufacturer Ref" in merged.columns else None
+
+    if ref_col:
+        agg = {"Qty_total": "sum"}
+        cols_group = [ref_col]
+        extra_cols = [c for c in ["Value", "Footprint", "type"] if c in merged.columns]
+
+        most_recurring = (
+            merged.groupby(cols_group + extra_cols, dropna=False)
+            .agg(Qty_total=("Qty_total", "sum"), Nb_lignes_BOM=("Qty_total", "size"))
+            .reset_index()
+            .sort_values("Qty_total", ascending=False)
+            .head(top_n)
+        )
+    else:
+        most_recurring = None
+
     return {
         "detail": merged,
         "missing": missing,
         "total_price": total_price,
+        "top_expensive": top_expensive,
+        "cost_by_type": cost_by_type,
+        "most_recurring": most_recurring,
     }
 
 
@@ -117,6 +168,29 @@ def print_report(report, n_pcb=1):
     print(f"Lignes OK                  : {(detail['Status'] == 'OK').sum()}")
     print(f"Lignes incomplètes/erreurs : {len(missing)}")
     print(f"Prix total estimé          : {total_price:.2f} EUR")
+
+    print("-" * 60)
+    print("Top composants les plus chers :")
+    if report.get("top_expensive") is not None and not report["top_expensive"].empty:
+        print(report["top_expensive"].to_string(index=False))
+    else:
+        print("  (pas assez de données de prix)")
+
+    print("-" * 60)
+    print("Coût par famille de composant :")
+    if report.get("cost_by_type") is not None and not report["cost_by_type"].empty:
+        for type_, cout in report["cost_by_type"].items():
+            print(f"  {type_!s:25} {cout:8.2f} EUR")
+    else:
+        print("  (colonne 'type' absente de la librairie)")
+
+    print("-" * 60)
+    print("Composants les plus récurrents :")
+    if report.get("most_recurring") is not None and not report["most_recurring"].empty:
+        print(report["most_recurring"].to_string(index=False))
+    else:
+        print("  (pas de colonne Manufacturer Ref)")
+
     print("-" * 60)
 
     if not missing.empty:
@@ -133,11 +207,22 @@ def print_report(report, n_pcb=1):
 
 
 def export_report_excel(report, output_path, n_pcb=1):
-    """Exporte le rapport (détail + composants à vérifier + résumé) en Excel."""
+    """Exporte le rapport (détail, à vérifier, résumé, et analyses) en Excel."""
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         report["detail"].to_excel(writer, sheet_name="Detail", index=False)
         report["missing"].to_excel(writer, sheet_name="A verifier", index=False)
+
+        if report.get("top_expensive") is not None:
+            report["top_expensive"].to_excel(writer, sheet_name="Plus chers", index=False)
+
+        if report.get("cost_by_type") is not None:
+            report["cost_by_type"].rename("Line_total_price").to_frame().to_excel(
+                writer, sheet_name="Cout par famille"
+            )
+
+        if report.get("most_recurring") is not None:
+            report["most_recurring"].to_excel(writer, sheet_name="Plus recurrents", index=False)
 
         summary = pd.DataFrame({
             "Metrique": ["Nombre de PCB", "Prix total (EUR)", "Lignes OK", "Lignes a verifier"],
