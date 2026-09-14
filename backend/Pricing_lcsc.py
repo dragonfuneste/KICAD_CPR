@@ -2,7 +2,8 @@ import requests
 import re
 import json
 import time
-
+import openpyxl
+import time
 # ============================================================
 # CONVERSION DE DEVISE (USD -> EUR), taux mis en cache
 # ============================================================
@@ -109,3 +110,61 @@ def get_lcsc_price_from_page(product_code, quantite=1):
         "stock": stock,
         "quantite_suffisante": (stock is not None and stock >= quantite),
     }
+
+
+def Update_Price_Stock(name,nom_feuille = "Feuille 1"):
+    wb = openpyxl.load_workbook(name)
+    ws = wb[nom_feuille]
+
+    # on repère la colonne de chaque en-tête (ligne 1) une seule fois
+    entetes = {}
+    for cell in ws[1]:
+        if cell.value:
+            entetes[str(cell.value).strip()] = cell.column  # numéro de colonne (1-based)
+
+    col_nom = entetes["Manufacturer Ref"]
+    col_lcsc = entetes["reference_LCSC"]
+
+    # si les colonnes Price / Stock n'existent pas encore, on les crée à la fin
+    if "Price" not in entetes:
+        entetes["Price"] = ws.max_column + 1
+        ws.cell(row=1, column=entetes["Price"], value="Price")
+    if "Stock website" not in entetes:
+        entetes["Stock website"] = ws.max_column + 1
+        ws.cell(row=1, column=entetes["Stock website"], value="Stock website")
+
+    col_price = entetes["Price"]
+    col_stock = entetes["Stock website"]
+
+    # on parcourt les lignes de données (à partir de la ligne 2)
+    for row_idx in range(2, ws.max_row + 1):
+        ref_lcsc_cell = ws.cell(row=row_idx, column=col_lcsc)
+        ref_lcsc = ref_lcsc_cell.value
+
+        if ref_lcsc is None or str(ref_lcsc).strip() == "":
+            continue
+
+        ref_lcsc = str(ref_lcsc).strip()
+        nom = ws.cell(row=row_idx, column=col_nom).value
+        print(nom, ref_lcsc)
+
+        try:
+            result = get_lcsc_price_from_page(ref_lcsc, 1)
+        except Exception as e:
+            print(f"Erreur inattendue pour {ref_lcsc} : {e}")
+            result = None
+
+        if result is None:
+            print(f"  -> aucun résultat pour {ref_lcsc}, on passe à la suite")
+            time.sleep(1)
+            continue
+
+        # on écrit uniquement la valeur, l'hyperlien de la cellule Ref LCSC
+        # n'est jamais touché puisqu'on ne modifie que les colonnes Price/Stock
+        ws.cell(row=row_idx, column=col_price, value=result["prix_unitaire_eur"])
+        ws.cell(row=row_idx, column=col_stock, value=result["stock"])
+
+        time.sleep(1)
+
+    wb.save(name)
+
