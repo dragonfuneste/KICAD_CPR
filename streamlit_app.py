@@ -26,7 +26,7 @@ st.set_page_config(page_title="BOM Checker", page_icon="🔧", layout="wide")
 
 # Librairie par défaut embarquée dans le repo (à côté de streamlit_app.py).
 # L'utilisateur peut la remplacer via l'upload ci-dessous.
-DEFAULT_LIB_PATH = Path(__file__).parent / "Component_library.xlsx"
+DEFAULT_LIB_PATH = Path(__file__).parent / "lib/Component_library.xlsx"
 
 
 # ============================================================
