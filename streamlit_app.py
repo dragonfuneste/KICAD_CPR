@@ -89,7 +89,12 @@ col1, col2 = st.columns(2)
 
 with col1:
     bom_file = st.file_uploader("BOM (.xlsx)", type=["xlsx"])
-    header_row = 7
+    header_row = st.number_input(
+        "Ligne d'en-tête du BOM (0 = première ligne)",
+        min_value=0, max_value=50, value=7,
+        help="Nombre de lignes de titre/logo avant les en-têtes de colonnes. "
+             "7 pour un export KiCad classique (comme Carte_radar_V0.2--BoM.xlsx).",
+    )
 
 with col2:
     lib_file = st.file_uploader(
