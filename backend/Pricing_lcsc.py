@@ -167,4 +167,3 @@ def Update_Price_Stock(name,nom_feuille = "Feuille 1"):
         time.sleep(1)
 
     wb.save(name)
-
