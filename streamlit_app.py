@@ -26,7 +26,7 @@ st.set_page_config(page_title="BOM Checker", page_icon="🔧", layout="wide")
 
 # Librairie par défaut embarquée dans le repo (à côté de streamlit_app.py).
 # L'utilisateur peut la remplacer via l'upload ci-dessous.
-DEFAULT_LIB_PATH = Path(__file__).parent / "lib/Component_library.xlsx"
+DEFAULT_LIB_PATH = Path(__file__).parent / "Component_library.xlsx"
 
 
 # ============================================================
@@ -73,6 +73,8 @@ if "lib" not in st.session_state:
     st.session_state.lib = None
 if "prices_updated" not in st.session_state:
     st.session_state.prices_updated = False
+if "report" not in st.session_state:
+    st.session_state.report = None
 
 
 st.title("🔧 BOM Checker")
@@ -237,24 +239,29 @@ if st.button("💰 Mettre à jour les prix et stocks"):
 
 st.header("4. Rapport")
 
-n_pcb = st.number_input("Nombre de PCB", min_value=1, value=10, step=1)
-
-if not st.session_state.prices_updated:
-    st.warning("Lance la mise à jour des prix (étape 3) avant de générer le rapport, sinon les prix seront manquants.")
+c_pcb, c_topn = st.columns(2)
+with c_pcb:
+    n_pcb = st.number_input("Nombre de PCB", min_value=1, value=10, step=1)
+with c_topn:
+    top_n = st.number_input("Nombre de lignes dans les classements", min_value=3, max_value=30, value=10, step=1)
 
 if st.button("📊 Générer le rapport"):
-
     bom = st.session_state.bom
     lib = st.session_state.lib
+    st.session_state.report = build_bom_report(bom, lib, n_pcb=n_pcb, top_n=top_n)
+    st.session_state.report_n_pcb = n_pcb
 
-    report = build_bom_report(bom, lib, n_pcb=n_pcb)
+if st.session_state.get("report") is not None:
+
+    report = st.session_state.report
+    n_pcb_affiche = st.session_state.get("report_n_pcb", n_pcb)
 
     detail = report["detail"]
     missing = report["missing"]
     total_price = report["total_price"]
 
     c1, c2, c3 = st.columns(3)
-    c1.metric(f"Prix total pour {n_pcb} PCB", f"{total_price:.2f} €")
+    c1.metric(f"Prix total pour {n_pcb_affiche} PCB", f"{total_price:.2f} €")
     c2.metric("Lignes OK", (detail["Status"] == "OK").sum())
     c3.metric("Lignes à vérifier", len(missing))
 
@@ -268,12 +275,48 @@ if st.button("📊 Générer le rapport"):
     else:
         st.success("Tous les composants sont correctement identifiés.")
 
+    st.divider()
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.subheader("💸 Composants les plus chers")
+        top_expensive = report.get("top_expensive")
+        if top_expensive is not None and not top_expensive.empty:
+            st.dataframe(top_expensive, use_container_width=True, hide_index=True)
+        else:
+            st.info("Pas assez de données de prix pour ce classement.")
+
+    with col_b:
+        st.subheader("🔁 Composants les plus récurrents")
+        most_recurring = report.get("most_recurring")
+        if most_recurring is not None and not most_recurring.empty:
+            st.dataframe(most_recurring, use_container_width=True, hide_index=True)
+        else:
+            st.info("Pas de colonne Manufacturer Ref pour ce classement.")
+
+    st.subheader("🏷️ Coût par famille de composant")
+    cost_by_type = report.get("cost_by_type")
+    if cost_by_type is not None and not cost_by_type.empty:
+        c_chart, c_table = st.columns([2, 1])
+        with c_chart:
+            st.bar_chart(cost_by_type)
+        with c_table:
+            st.dataframe(
+                cost_by_type.rename("Coût total (€)").to_frame(),
+                use_container_width=True,
+            )
+    else:
+        st.info("Colonne 'type' absente de la librairie : impossible de grouper par famille.")
+
+    st.divider()
+
     with st.expander("Voir le détail complet"):
         st.dataframe(detail, use_container_width=True)
 
     # Export Excel du rapport
     report_path = st.session_state.workdir / "rapport_bom.xlsx"
-    export_report_excel(report, str(report_path), n_pcb=n_pcb)
+    export_report_excel(report, str(report_path), n_pcb=n_pcb_affiche)
 
     st.download_button(
         "⬇️ Télécharger le rapport (.xlsx)",
