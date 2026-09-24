@@ -4,6 +4,7 @@ Application Streamlit : reprise du workflow du notebook (Notebook_back.ipynb)
 - Upload BOM + Librairie de composants (.xlsx)
 - Recherche automatique dans la lib (Manufacturer Ref / Footprint / Value)
 - Remplissage du LCSC_part_number + détection des écarts (mismatch, Mouser only...)
+- Affichage côte à côte BOM / composant retenu dans la lib
 - Mise à jour prix/stock (scraping LCSC) sur la librairie
 - Rapport final : prix total pour n PCB, composants à vérifier
 - Téléchargement des fichiers résultats
@@ -59,6 +60,63 @@ def _status_for_display(row: pd.Series) -> str:
     return "✅ OK"
 
 
+def describe_match(result) -> dict:
+    """Résume le(s) composant(s) trouvé(s) dans la lib pour une ligne de BOM."""
+    vide = {
+        "Nb_matches": 0,
+        "Lib_Manufacturer_Ref": "",
+        "Lib_Value": "",
+        "Lib_Footprint": "",
+        "Lib_LCSC": "",
+    }
+    if result is None or result.empty:
+        return vide
+
+    def _join(col, max_items=3):
+        if col not in result.columns:
+            return ""
+        vals = result[col].dropna().astype(str).unique()
+        s = " | ".join(vals[:max_items])
+        if len(vals) > max_items:
+            s += f" (+{len(vals) - max_items})"
+        return s
+
+    return {
+        "Nb_matches": len(result),
+        "Lib_Manufacturer_Ref": _join("Manufacturer Ref"),
+        "Lib_Value": _join("Value"),
+        "Lib_Footprint": _join("Footprint"),
+        "Lib_LCSC": _join("reference_LCSC"),
+    }
+
+
+def _norm(x) -> str:
+    return "" if pd.isna(x) else str(x).strip().lower()
+
+
+def match_verdict(row) -> str:
+    """Verdict simple sur la correspondance BOM <-> lib."""
+    n = row.get("Nb_matches", 0)
+    if n == 0:
+        return "❌ Aucun"
+    if n > 1:
+        return f"❓ {n} candidats"
+    if _norm(row.get("Manufacturer Ref")) == _norm(row.get("Lib_Manufacturer_Ref")):
+        return "✅ Identique"
+    return "🔶 Réf différente"
+
+
+def _color_match(val):
+    if isinstance(val, str):
+        if val.startswith("✅"):
+            return "background-color: #d4edda"
+        if val.startswith(("🔶", "❓")):
+            return "background-color: #fff3cd"
+        if val.startswith("❌"):
+            return "background-color: #f8d7da"
+    return ""
+
+
 # ============================================================
 # Etat de session
 # ============================================================
@@ -71,6 +129,8 @@ if "lib_path" not in st.session_state:
     st.session_state.lib_path = None
 if "lib" not in st.session_state:
     st.session_state.lib = None
+if "matches" not in st.session_state:
+    st.session_state.matches = None
 if "prices_updated" not in st.session_state:
     st.session_state.prices_updated = False
 if "report" not in st.session_state:
@@ -163,9 +223,11 @@ if st.button("🔍 Lancer la recherche et remplir le BOM", type="primary"):
 
     progress = st.progress(0, text="Recherche en cours...")
     nb = len(bom)
+    matches = {}
 
     for i, (index, row) in enumerate(bom.iterrows()):
         result = search_in_lib(lib, row)
+        matches[index] = describe_match(result)
         row = fill_bom_result(row, result)
         row = check_bom(row, result)
         bom.loc[index] = row
@@ -173,6 +235,7 @@ if st.button("🔍 Lancer la recherche et remplir le BOM", type="primary"):
 
     progress.empty()
     st.session_state.bom = bom
+    st.session_state.matches = pd.DataFrame.from_dict(matches, orient="index")
     st.success("Recherche terminée.")
 
 if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.bom.columns:
@@ -181,6 +244,11 @@ if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.b
 
     apercu = bom.copy()
     apercu["Statut"] = apercu.apply(_status_for_display, axis=1)
+
+    matches = st.session_state.get("matches")
+    if matches is not None:
+        apercu = apercu.join(matches)
+        apercu["Match"] = apercu.apply(match_verdict, axis=1)
 
     nb_ok = (apercu["Statut"] == "✅ OK").sum()
     nb_warn = apercu["Statut"].str.startswith("⚠️").sum()
@@ -191,12 +259,27 @@ if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.b
     c2.metric("À vérifier", nb_warn)
     c3.metric("Non détecté", nb_ko)
 
+    only_check = st.checkbox("Afficher uniquement les lignes à vérifier")
+    if only_check and "Match" in apercu.columns:
+        apercu = apercu[apercu["Match"] != "✅ Identique"]
+
+    # Colonnes BOM / lib côte à côte pour comparer facilement
     cols_a_montrer = [c for c in [
-        "References", "Manufacturer Ref", "Value", "Footprint",
-        "LCSC_part_number", "Comments", "Statut",
+        "References",
+        "Match",
+        "Manufacturer Ref", "Lib_Manufacturer_Ref",
+        "Value", "Lib_Value",
+        "Footprint", "Lib_Footprint",
+        "LCSC_part_number", "Lib_LCSC",
+        "Nb_matches", "Comments", "Statut",
     ] if c in apercu.columns]
 
-    st.dataframe(apercu[cols_a_montrer], use_container_width=True, height=400)
+    tableau = apercu[cols_a_montrer]
+    if "Match" in tableau.columns:
+        # pandas < 2.1 : remplacer .map par .applymap
+        tableau = tableau.style.map(_color_match, subset=["Match"])
+
+    st.dataframe(tableau, use_container_width=True, height=400)
 
     st.download_button(
         "⬇️ Télécharger le BOM (état actuel)",
