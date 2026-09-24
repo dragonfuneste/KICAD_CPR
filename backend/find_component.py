@@ -12,6 +12,10 @@ def find_by_value(column, library, value, top_n=5, score_gap=10):
     Retourne toujours un DataFrame.
     """
 
+    # Colonne convertie en texte : la lib peut contenir des nombres, des NaN,
+    # des types mixtes... rapidfuzz n'accepte que des chaînes.
+    col_str = library[column].astype(str)
+
     # ---------------------------------------------------------
     # 1. Recherche exacte
     # ---------------------------------------------------------
@@ -26,9 +30,7 @@ def find_by_value(column, library, value, top_n=5, score_gap=10):
     value_str = str(value)
 
     contains = library[
-        library[column]
-        .astype(str)
-        .str.contains(
+        col_str.str.contains(
             value_str,
             case=False,
             na=False,
@@ -42,7 +44,7 @@ def find_by_value(column, library, value, top_n=5, score_gap=10):
     # ---------------------------------------------------------
     # 3. Recherche floue
     # ---------------------------------------------------------
-    choices = library[column].dropna().unique()
+    choices = library.loc[library[column].notna(), column].astype(str).unique().tolist()
 
     if len(choices) == 0:
         return None
@@ -79,7 +81,7 @@ def find_by_value(column, library, value, top_n=5, score_gap=10):
     # ---------------------------------------------------------
     # Créer le DataFrame avec les lignes correspondantes
     # ---------------------------------------------------------
-    result = library[library[column].isin(selected_values)].copy()
+    result = library[library[column].notna() & col_str.isin(selected_values)].copy()
 
     return result
 
