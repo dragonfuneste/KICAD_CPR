@@ -155,6 +155,7 @@ def _candidate_table(cands: pd.DataFrame, qty_total: int) -> pd.DataFrame:
 
         rows.append({
             "_lib_idx": lib_idx,
+            "Ligne lib (Excel)": int(lib_idx) + 2,
             "Manufacturer Ref": c.get("Manufacturer Ref"),
             "LCSC": ref if _is_filled(ref) else "",
             "Mouser": c.get("reference_Mouser") if _is_filled(c.get("reference_Mouser")) else "",
@@ -224,11 +225,16 @@ def choose_component_dialog():
 
     st.dataframe(table.drop(columns=["_lib_idx"]), hide_index=True, use_container_width=True)
 
+    refs = table["LCSC"].replace("", pd.NA).dropna()
+    if refs.duplicated().any():
+        st.info("ℹ️ Plusieurs lignes de la librairie ont la même réf LCSC (doublons) : "
+                "le choix donnera le même résultat. Pense à supprimer le doublon dans la lib.")
+
     def _label(i):
         r = table.iloc[i]
         prix = "prix ?" if pd.isna(r["Prix unitaire (€)"]) else f"{r['Prix unitaire (€)']:.4f} €"
         stock = "stock ?" if pd.isna(r["Stock"]) else f"stock {int(r['Stock'])}"
-        return f"{r['Manufacturer Ref']}  |  {r['LCSC'] or 'sans LCSC'}  |  {prix}  |  {stock}  {r['Stock suffisant']}"
+        return f"Lib l.{r['Ligne lib (Excel)']}  |  {r['Manufacturer Ref']}  |  {r['LCSC'] or 'sans LCSC'}  |  {prix}  |  {stock}  {r['Stock suffisant']}"
 
     reco = _recommend(table, qty_total)
     st.caption("Présélection : le moins cher parmi ceux dont le stock couvre la quantité.")

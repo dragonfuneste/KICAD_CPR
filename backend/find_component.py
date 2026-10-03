@@ -134,9 +134,4 @@ def search_in_lib(library, bom_line):
         if len(result) == 1:
             break
 
-    if result is not None and not result.empty:
-        # Même composant présent plusieurs fois dans la lib : pas une vraie ambiguïté
-        keys = [c for c in ["reference_LCSC", "reference_Mouser", "Manufacturer Ref"] if c in result.columns]
-        result = result.drop_duplicates(subset=keys)
-
     return result
