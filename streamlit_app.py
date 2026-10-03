@@ -757,7 +757,16 @@ st.download_button(
 st.header("7. Stock vs BOM")
 st.caption("Compare la quantité totale nécessaire (toutes BOM, × nombre de PCB) au stock personnel.")
 
-if st.button("🧮 Vérifier le stock"):
+lib_now = st.session_state.lib
+nb_stock = int(pd.to_numeric(lib_now[STOCK_COL], errors="coerce").notna().sum()) if STOCK_COL in lib_now.columns else 0
+st.caption(f"📚 Librairie utilisée : **{Path(st.session_state.lib_path).name}** — "
+           f"{nb_stock} composant(s) avec un « {STOCK_COL} » renseigné.")
+
+if st.session_state.matches is None:
+    st.warning("Lance d'abord la recherche dans la librairie (section 2) : sans elle, les lignes du BOM "
+               "ne sont pas rattachées à la lib et leur stock ne peut pas être vérifié.")
+
+if st.button("🧮 Vérifier le stock", disabled=st.session_state.matches is None):
     comps, per_bom = build_component_list(st.session_state.bom, st.session_state.lib)
     st.session_state.components = (comps, per_bom)
     st.session_state.stock_check = build_stock_check(comps, st.session_state.lib)
@@ -774,6 +783,10 @@ if check is not None:
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Composants OK", int((check["Statut"] == "OK").sum()))
     k2.metric("En manque", len(manque))
+    nb_unknown = int((check["Statut"] == "NON IDENTIFIÉ").sum())
+    if nb_unknown:
+        st.warning(f"{nb_unknown} ligne(s) du BOM ne sont pas rattachées à la librairie (NON IDENTIFIÉ) : "
+                   "leur stock n'est pas vérifié. Résous-les via la section 2 (pop-up de choix) ou ajoute-les à la lib.")
     k3.metric("Pièces manquantes", int(manque["Manquant"].sum()))
     k4.metric("Coût estimé du réassort", f"{cout:.2f} €")
 

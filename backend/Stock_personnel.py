@@ -112,6 +112,30 @@ def _lib_stock(lib: pd.DataFrame, idx) -> float:
     return 0.0 if pd.isna(v) else float(v)
 
 
+def _index(lib: pd.DataFrame, col: str) -> dict:
+    """clé normalisée -> liste des index de lib (la lib peut contenir des doublons)."""
+    d = {}
+    if col not in lib.columns:
+        return d
+    for idx, v in lib[col].items():
+        k = _norm(v)
+        if k:
+            d.setdefault(k, []).append(idx)
+    return d
+
+
+def _best(lib: pd.DataFrame, idxs):
+    """Parmi des doublons : la 1re ligne qui a déjà un stock renseigné, sinon la 1re."""
+    if not idxs:
+        return None
+    if STOCK_COL in lib.columns:
+        for i in idxs:
+            v = pd.to_numeric(lib.loc[i, STOCK_COL], errors="coerce")
+            if pd.notna(v) and v > 0:
+                return i
+    return idxs[0]
+
+
 def plan_stock_import(lib: pd.DataFrame, entries: pd.DataFrame) -> pd.DataFrame:
     """
     Prévisualise l'import : pour chaque ligne de commande, quelle ligne de la
@@ -119,25 +143,19 @@ def plan_stock_import(lib: pd.DataFrame, entries: pd.DataFrame) -> pd.DataFrame:
     Rien n'est écrit. Le stock est mis sur la PREMIÈRE ligne de lib trouvée
     (évite de compter deux fois si la lib contient un doublon).
     """
-    by_lcsc, by_mouser, by_mpn = {}, {}, {}
-    for idx, r in lib.iterrows():
-        for d, col in ((by_lcsc, "reference_LCSC"), (by_mouser, "reference_Mouser")):
-            k = _norm(r.get(col))
-            if k:
-                d.setdefault(k, idx)
-        for col in ("Manufacturer Ref", "Manufacturer Part"):
-            k = _norm(r.get(col))
-            if k:
-                by_mpn.setdefault(k, idx)
+    by_lcsc, by_mouser = _index(lib, "reference_LCSC"), _index(lib, "reference_Mouser")
+    by_mpn = _index(lib, "Manufacturer Ref")
+    for k, v in _index(lib, "Manufacturer Part").items():
+        by_mpn.setdefault(k, []).extend(v)
 
     current = {}
     rows = []
     for _, e in entries.iterrows():
-        ref_idx = (by_lcsc if e["Fournisseur"] == "LCSC" else by_mouser).get(_norm(e["Ref"]))
+        ref_idx = _best(lib, (by_lcsc if e["Fournisseur"] == "LCSC" else by_mouser).get(_norm(e["Ref"])))
         method = "Réf fournisseur"
         lib_idx = ref_idx
         if lib_idx is None:
-            lib_idx = by_mpn.get(_norm(e["MPN"]))
+            lib_idx = _best(lib, by_mpn.get(_norm(e["MPN"])))
             method = "Réf fabricant"
 
         if lib_idx is None:
@@ -281,28 +299,22 @@ def build_stock_check(components: pd.DataFrame, lib: pd.DataFrame) -> pd.DataFra
     Retourne une ligne par composant avec : besoin, stock, manquant, statut,
     prix unitaire et coût du manquant.
     """
-    by_lcsc, by_mouser = {}, {}
-    for idx, r in lib.iterrows():
-        k = _norm(r.get("reference_LCSC"))
-        if k:
-            by_lcsc.setdefault(k, idx)
-        k = _norm(r.get("reference_Mouser"))
-        if k:
-            by_mouser.setdefault(k, idx)
+    by_lcsc, by_mouser = _index(lib, "reference_LCSC"), _index(lib, "reference_Mouser")
 
     rows = []
     for _, c in components.iterrows():
-        idx = by_lcsc.get(_norm(c["Ref LCSC"])) if _norm(c["Ref LCSC"]) else None
+        idx = _best(lib, by_lcsc.get(_norm(c["Ref LCSC"]))) if _norm(c["Ref LCSC"]) else None
         if idx is None and _norm(c["Ref Mouser"]):
-            idx = by_mouser.get(_norm(c["Ref Mouser"]))
+            idx = _best(lib, by_mouser.get(_norm(c["Ref Mouser"])))
 
         need = int(c["Qté totale"])
+        unknown = c["Statut"] != "OK"   # ligne de BOM non rattachée à la lib : on ne peut pas connaître son stock
         stock = _lib_stock(lib, idx) if idx is not None else 0.0
         missing = max(need - stock, 0)
 
         price = pd.to_numeric(lib.loc[idx, "Price"], errors="coerce") if (idx is not None and "Price" in lib.columns) else float("nan")
 
-        if c["Statut"] != "OK":
+        if unknown:
             statut = "NON IDENTIFIÉ"
         elif idx is None:
             statut = "ABSENT DE LA LIB"
@@ -315,7 +327,10 @@ def build_stock_check(components: pd.DataFrame, lib: pd.DataFrame) -> pd.DataFra
             "Composant": c["Composant"], "Valeur": c["Valeur"], "Type": c["Type"],
             "Footprint": c["Footprint"], "Ref LCSC": c["Ref LCSC"], "Ref Mouser": c["Ref Mouser"],
             "BOM concernées": c["BOM concernées"],
-            "Besoin": need, "Stock perso": _as_int_if_whole(stock), "Manquant": _as_int_if_whole(missing),
+            "Besoin": need,
+            "Stock perso": None if unknown else _as_int_if_whole(stock),
+            "Manquant": None if unknown else _as_int_if_whole(missing),
+            "Ligne lib (Excel)": None if idx is None else int(idx) + 2,
             "Prix unitaire (€)": None if pd.isna(price) else float(price),
             "Coût du manquant (€)": None if pd.isna(price) else round(float(price) * missing, 2),
             "Statut": statut,
