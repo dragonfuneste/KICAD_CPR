@@ -18,9 +18,9 @@ import pandas as pd
 import streamlit as st
 
 from backend.find_component import search_in_lib
-from backend.BOM_function import fill_bom_result, check_bom
-from backend.Pricing_lcsc import Update_Price_Stock
-from backend.BOM_report import build_bom_report, export_report_excel
+from backend.BOM_function import fill_bom_result, check_bom, _add_comment
+from backend.Pricing_lcsc import Update_Price_Stock, get_lcsc_price_from_page
+from backend.BOM_report import build_bom_report, export_report_excel, _get_quantity_column
 
 
 st.set_page_config(page_title="BOM Checker", page_icon="🔧", layout="wide")
@@ -117,6 +117,143 @@ def _color_match(val):
     return ""
 
 
+
+# ============================================================
+# Choix d'un composant quand plusieurs candidats identiques (pop-up)
+# ============================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _live_lcsc(ref: str, qty: int):
+    """Prix + stock LCSC en direct (mis en cache 15 min pour ne pas re-scraper)."""
+    try:
+        return get_lcsc_price_from_page(ref, qty)
+    except Exception:
+        return None
+
+
+def _is_filled(x) -> bool:
+    return pd.notna(x) and str(x).strip() != ""
+
+
+def _candidate_table(cands: pd.DataFrame, qty_total: int) -> pd.DataFrame:
+    """Un tableau prix/stock par candidat (live LCSC, sinon valeurs de la lib)."""
+    rows = []
+    for lib_idx, c in cands.iterrows():
+        ref = c.get("reference_LCSC")
+        price, stock, source = None, None, "Pas de réf. LCSC"
+
+        if _is_filled(ref):
+            live = _live_lcsc(str(ref).strip(), qty_total)
+            if live and live.get("prix_unitaire_eur") is not None:
+                price, stock, source = live["prix_unitaire_eur"], live["stock"], "LCSC (live)"
+            else:
+                p = pd.to_numeric(c.get("Price"), errors="coerce")
+                s_ = pd.to_numeric(c.get("Stock website"), errors="coerce")
+                price = None if pd.isna(p) else float(p)
+                stock = None if pd.isna(s_) else int(s_)
+                source = "Librairie (cache)" if (price is not None or stock is not None) else "Indisponible"
+
+        rows.append({
+            "_lib_idx": lib_idx,
+            "Manufacturer Ref": c.get("Manufacturer Ref"),
+            "LCSC": ref if _is_filled(ref) else "",
+            "Mouser": c.get("reference_Mouser") if _is_filled(c.get("reference_Mouser")) else "",
+            "Prix unitaire (€)": price,
+            "Stock": stock,
+            "Stock suffisant": "—" if stock is None else ("✅" if stock >= qty_total else "❌"),
+            "Prix ligne (€)": None if price is None else round(price * qty_total, 3),
+            "Source": source,
+        })
+    return pd.DataFrame(rows)
+
+
+def _recommend(table: pd.DataFrame, qty_total: int) -> int:
+    """Position conseillée : le moins cher parmi ceux en stock suffisant, sinon le plus gros stock."""
+    ok = table[table["Stock"].notna() & (table["Stock"] >= qty_total) & table["Prix unitaire (€)"].notna()]
+    if not ok.empty:
+        return table.index.get_loc(ok["Prix unitaire (€)"].idxmin())
+    in_stock = table[table["Stock"].notna()]
+    if not in_stock.empty:
+        return table.index.get_loc(in_stock["Stock"].idxmax())
+    return 0
+
+
+def _apply_choice(index, chosen: pd.Series):
+    """Écrit le composant choisi dans le BOM (et met à jour l'aperçu BOM/lib)."""
+    bom = st.session_state.bom
+    ref = chosen.get("reference_LCSC")
+
+    if _is_filled(ref):
+        bom.loc[index, "LCSC_part_number"] = str(ref).strip()
+    else:
+        mouser = chosen.get("reference_Mouser")
+        msg = f"NO LCSC REF - MOUSER: {mouser}" if _is_filled(mouser) else "NO LCSC REF"
+        line = _add_comment(bom.loc[index].copy(), msg)
+        bom.loc[index] = line
+
+    if st.session_state.matches is not None:
+        for k, v in describe_match(chosen.to_frame().T).items():
+            st.session_state.matches.loc[index, k] = v
+
+
+@st.dialog("Plusieurs composants possibles", width="large")
+def choose_component_dialog():
+    pending = st.session_state.pending
+    if not pending:
+        st.rerun()
+
+    index = next(iter(pending))
+    cands = pending[index]
+    bom = st.session_state.bom
+    line = bom.loc[index]
+
+    qty_col = _get_quantity_column(bom)
+    qty_line = pd.to_numeric(line.get(qty_col), errors="coerce") if qty_col else 1
+    qty_line = 1 if pd.isna(qty_line) else qty_line
+    qty_total = max(int(qty_line * st.session_state.n_pcb), 1)
+
+    st.caption(f"{len(pending)} ligne(s) restante(s) à trancher")
+    st.markdown(
+        f"**{line.get('References', '')}**  \n"
+        f"Valeur : `{line.get('Value', '')}` — Footprint : `{line.get('Footprint', '')}`  \n"
+        f"Quantité nécessaire : **{qty_total}** ({int(qty_line)} × {st.session_state.n_pcb} PCB)"
+    )
+
+    with st.spinner("Vérification prix / stock sur LCSC..."):
+        table = _candidate_table(cands, qty_total)
+
+    st.dataframe(table.drop(columns=["_lib_idx"]), hide_index=True, use_container_width=True)
+
+    def _label(i):
+        r = table.iloc[i]
+        prix = "prix ?" if pd.isna(r["Prix unitaire (€)"]) else f"{r['Prix unitaire (€)']:.4f} €"
+        stock = "stock ?" if pd.isna(r["Stock"]) else f"stock {int(r['Stock'])}"
+        return f"{r['Manufacturer Ref']}  |  {r['LCSC'] or 'sans LCSC'}  |  {prix}  |  {stock}  {r['Stock suffisant']}"
+
+    reco = _recommend(table, qty_total)
+    st.caption("Présélection : le moins cher parmi ceux dont le stock couvre la quantité.")
+    choice = st.radio(
+        "Composant retenu",
+        options=list(range(len(table))),
+        index=reco,
+        format_func=_label,
+        key=f"choice_{index}",
+    )
+
+    def _done():
+        pending.pop(index, None)
+        # on enchaîne sur la ligne suivante
+        st.session_state.auto_open_dialog = bool(pending)
+        st.rerun()
+
+    c_ok, c_skip = st.columns(2)
+    if c_ok.button("✅ Valider ce composant", type="primary", use_container_width=True):
+        _apply_choice(index, cands.loc[table.iloc[choice]["_lib_idx"]])
+        _done()
+    if c_skip.button("⏭️ Ignorer (laisser vide)", use_container_width=True):
+        _done()
+
+
 # ============================================================
 # Etat de session
 # ============================================================
@@ -135,6 +272,8 @@ if "prices_updated" not in st.session_state:
     st.session_state.prices_updated = False
 if "report" not in st.session_state:
     st.session_state.report = None
+if "pending" not in st.session_state:
+    st.session_state.pending = {}
 
 
 st.title("🔧 BOM Checker")
@@ -216,6 +355,9 @@ else:
 
 st.header("2. Recherche dans la librairie")
 
+st.number_input("Nombre de PCB", min_value=1, value=10, step=1, key="n_pcb",
+                help="Sert à calculer la quantité totale pour vérifier le stock / le palier de prix.")
+
 if st.button("🔍 Lancer la recherche et remplir le BOM", type="primary"):
 
     bom = st.session_state.bom.copy()
@@ -224,6 +366,7 @@ if st.button("🔍 Lancer la recherche et remplir le BOM", type="primary"):
     progress = st.progress(0, text="Recherche en cours...")
     nb = len(bom)
     matches = {}
+    pending = {}
 
     for i, (index, row) in enumerate(bom.iterrows()):
         result = search_in_lib(lib, row)
@@ -231,12 +374,28 @@ if st.button("🔍 Lancer la recherche et remplir le BOM", type="primary"):
         row = fill_bom_result(row, result)
         row = check_bom(row, result)
         bom.loc[index] = row
+
+        # Plusieurs candidats (après dédoublonnage) et rien de rempli -> choix manuel
+        if (
+            result is not None and len(result) > 1
+            and not _is_filled(row.get("LCSC_part_number"))
+        ):
+            pending[index] = result
+
         progress.progress((i + 1) / nb, text=f"Ligne {i + 1}/{nb}")
 
     progress.empty()
     st.session_state.bom = bom
     st.session_state.matches = pd.DataFrame.from_dict(matches, orient="index")
+    st.session_state.pending = pending
+    st.session_state.auto_open_dialog = bool(pending)
     st.success("Recherche terminée.")
+
+if st.session_state.pending:
+    st.warning(f"{len(st.session_state.pending)} ligne(s) avec plusieurs composants possibles : "
+               "à choisir selon le prix et le stock.")
+    if st.button("🧩 Choisir les composants") or st.session_state.pop("auto_open_dialog", False):
+        choose_component_dialog()
 
 if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.bom.columns:
 
@@ -317,11 +476,9 @@ if st.button("💰 Mettre à jour les prix et stocks"):
 
 st.header("4. Rapport")
 
-c_pcb, c_topn = st.columns(2)
-with c_pcb:
-    n_pcb = st.number_input("Nombre de PCB", min_value=1, value=10, step=1)
-with c_topn:
-    top_n = st.number_input("Nombre de lignes dans les classements", min_value=3, max_value=30, value=10, step=1)
+n_pcb = st.session_state.n_pcb
+st.caption(f"Rapport calculé pour {n_pcb} PCB (réglable dans la section 2).")
+top_n = st.number_input("Nombre de lignes dans les classements", min_value=3, max_value=30, value=10, step=1)
 
 if st.button("📊 Générer le rapport"):
     bom = st.session_state.bom
