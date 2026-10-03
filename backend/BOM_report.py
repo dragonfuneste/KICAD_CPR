@@ -83,7 +83,12 @@ def build_bom_report(bom, lib, n_pcb=1, quantity_column=None, top_n=10):
         qty_per_board = pd.Series(1, index=merged.index)
 
     merged["Qty_per_PCB"] = qty_per_board
-    merged["Qty_total"] = qty_per_board * n_pcb
+    # Si le BOM est la fusion de plusieurs BOM, chaque ligne a son propre nombre de PCB
+    if "N_PCB" in merged.columns:
+        n_series = pd.to_numeric(merged["N_PCB"], errors="coerce").fillna(n_pcb)
+    else:
+        n_series = n_pcb
+    merged["Qty_total"] = qty_per_board * n_series
 
     merged["Unit_price"] = pd.to_numeric(merged.get("Price"), errors="coerce")
     merged["Line_total_price"] = merged["Unit_price"] * merged["Qty_total"]

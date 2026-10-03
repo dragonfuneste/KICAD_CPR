@@ -21,6 +21,7 @@ from backend.find_component import search_in_lib
 from backend.BOM_function import fill_bom_result, check_bom, _add_comment
 from backend.Pricing_lcsc import Update_Price_Stock, get_lcsc_price_from_page
 from backend.BOM_report import build_bom_report, export_report_excel, _get_quantity_column
+from backend.BOM_components import build_component_list, export_component_list_excel
 
 
 st.set_page_config(page_title="BOM Checker", page_icon="🔧", layout="wide")
@@ -197,6 +198,21 @@ def _apply_choice(index, chosen: pd.Series):
             st.session_state.matches.loc[index, k] = v
 
 
+def _signature(line) -> tuple:
+    """Deux lignes de BOM avec la même signature demandent le même composant."""
+    return (_norm(line.get("Manufacturer Ref")), _norm(line.get("Value")), _norm(line.get("Footprint")))
+
+
+def _qty_total_for(bom: pd.DataFrame, idx) -> float:
+    """Quantité par PCB x nombre de PCB de la BOM de cette ligne."""
+    qty_col = _get_quantity_column(bom)
+    q = pd.to_numeric(bom.loc[idx, qty_col], errors="coerce") if qty_col else 1
+    q = 1 if pd.isna(q) else q
+    n = pd.to_numeric(bom.loc[idx, "N_PCB"], errors="coerce") if "N_PCB" in bom.columns else 1
+    n = 1 if pd.isna(n) else n
+    return q * n
+
+
 @st.dialog("Plusieurs composants possibles", width="large")
 def choose_component_dialog():
     pending = st.session_state.pending
@@ -208,17 +224,20 @@ def choose_component_dialog():
     bom = st.session_state.bom
     line = bom.loc[index]
 
-    qty_col = _get_quantity_column(bom)
-    qty_line = pd.to_numeric(line.get(qty_col), errors="coerce") if qty_col else 1
-    qty_line = 1 if pd.isna(qty_line) else qty_line
-    qty_total = max(int(qty_line * st.session_state.n_pcb), 1)
+    # Même composant demandé dans plusieurs BOM : une seule question, quantités cumulées
+    sig = _signature(line)
+    group = [k for k in pending if _signature(bom.loc[k]) == sig]
+    qty_total = max(int(sum(_qty_total_for(bom, k) for k in group)), 1)
+    boms_txt = ", ".join(dict.fromkeys(str(bom.loc[k, "BOM"]) for k in group)) if "BOM" in bom.columns else ""
 
     st.caption(f"{len(pending)} ligne(s) restante(s) à trancher")
     st.markdown(
         f"**{line.get('References', '')}**  \n"
         f"Valeur : `{line.get('Value', '')}` — Footprint : `{line.get('Footprint', '')}`  \n"
-        f"Quantité nécessaire : **{qty_total}** ({int(qty_line)} × {st.session_state.n_pcb} PCB)"
+        f"BOM : **{boms_txt}** — quantité nécessaire : **{qty_total}**"
     )
+    if len(group) > 1:
+        st.info(f"Ce choix s'appliquera aux {len(group)} lignes identiques des BOM : {boms_txt}.")
 
     with st.spinner("Vérification prix / stock sur LCSC..."):
         table = _candidate_table(cands, qty_total)
@@ -247,14 +266,17 @@ def choose_component_dialog():
     )
 
     def _done():
-        pending.pop(index, None)
+        for k in group:
+            pending.pop(k, None)
         # on enchaîne sur la ligne suivante
         st.session_state.auto_open_dialog = bool(pending)
         st.rerun()
 
     c_ok, c_skip = st.columns(2)
     if c_ok.button("✅ Valider ce composant", type="primary", use_container_width=True):
-        _apply_choice(index, cands.loc[table.iloc[choice]["_lib_idx"]])
+        chosen = cands.loc[table.iloc[choice]["_lib_idx"]]
+        for k in group:
+            _apply_choice(k, chosen)
         _done()
     if c_skip.button("⏭️ Ignorer (laisser vide)", use_container_width=True):
         _done()
@@ -280,6 +302,10 @@ if "report" not in st.session_state:
     st.session_state.report = None
 if "pending" not in st.session_state:
     st.session_state.pending = {}
+if "components" not in st.session_state:
+    st.session_state.components = None
+if "bom_signature" not in st.session_state:
+    st.session_state.bom_signature = None
 
 
 st.title("🔧 BOM Checker")
@@ -295,7 +321,7 @@ st.header("1. Fichiers")
 col1, col2 = st.columns(2)
 
 with col1:
-    bom_file = st.file_uploader("BOM (.xlsx)", type=["xlsx"])
+    bom_files = st.file_uploader("BOM (.xlsx) — une ou plusieurs", type=["xlsx"], accept_multiple_files=True)
     header_row = 7
 
 with col2:
@@ -306,7 +332,25 @@ with col2:
              "Charge un fichier ici pour la remplacer.",
     )
 
-if bom_file is not None:
+if bom_files:
+
+    # Nom + nombre de PCB pour chaque BOM
+    st.subheader("Nom et nombre de PCB de chaque BOM")
+    bom_settings = []
+    for i, f in enumerate(bom_files):
+        c_name, c_n = st.columns([3, 1])
+        name = c_name.text_input(
+            f"Nom attribué à « {f.name} »", value=Path(f.name).stem, key=f"bom_name_{i}_{f.name}_{f.size}"
+        )
+        n = c_n.number_input(
+            "Nb de PCB", min_value=1, value=10, step=1, key=f"bom_npcb_{i}_{f.name}_{f.size}",
+            help="Sert aux quantités totales, au stock à vérifier et au prix.",
+        )
+        bom_settings.append({"name": name.strip() or Path(f.name).stem, "n_pcb": int(n)})
+
+    noms = [b["name"] for b in bom_settings]
+    if len(set(noms)) < len(noms):
+        st.warning("Deux BOM ont le même nom : donne-leur des noms différents pour les distinguer dans la liste finale.")
 
     if lib_file is not None:
         lib_path = _save_uploaded_file(lib_file, st.session_state.workdir)
@@ -328,15 +372,29 @@ if bom_file is not None:
     st.session_state.lib_path = lib_path
 
     try:
-        bom_raw = pd.read_excel(bom_file, header=header_row).dropna(how="all")
-        if "Row" in bom_raw.columns:
-            bom_raw = bom_raw.drop(columns=["Row"])
-        if "LCSC_part_number" not in bom_raw.columns:
-            bom_raw["LCSC_part_number"] = pd.NA
-        if "Comments" not in bom_raw.columns:
-            bom_raw["Comments"] = pd.NA
-        bom_raw["LCSC_part_number"] = bom_raw["LCSC_part_number"].astype("object")
-        bom_raw["Comments"] = bom_raw["Comments"].astype("object")
+        # On (re)construit le BOM combiné seulement si les fichiers ont changé
+        signature = tuple((f.name, f.size) for f in bom_files)
+        if st.session_state.bom_signature != signature:
+            frames = []
+            for i, f in enumerate(bom_files):
+                raw = pd.read_excel(f, header=header_row).dropna(how="all")
+                if "Row" in raw.columns:
+                    raw = raw.drop(columns=["Row"])
+                if "LCSC_part_number" not in raw.columns:
+                    raw["LCSC_part_number"] = pd.NA
+                if "Comments" not in raw.columns:
+                    raw["Comments"] = pd.NA
+                raw["LCSC_part_number"] = raw["LCSC_part_number"].astype("object")
+                raw["Comments"] = raw["Comments"].astype("object")
+                raw["BOM_id"] = i
+                frames.append(raw)
+
+            st.session_state.bom = pd.concat(frames, ignore_index=True)
+            st.session_state.bom_signature = signature
+            st.session_state.matches = None
+            st.session_state.pending = {}
+            st.session_state.report = None
+            st.session_state.components = None
 
         lib_df = pd.read_excel(lib_path)
 
@@ -344,14 +402,15 @@ if bom_file is not None:
         st.error(f"Erreur de lecture des fichiers : {e}")
         st.stop()
 
-    if st.session_state.bom is None:
-        st.session_state.bom = bom_raw
+    # Nom / nb de PCB modifiables à tout moment sans perdre la recherche déjà faite
+    st.session_state.bom["BOM"] = st.session_state.bom["BOM_id"].map({i: b["name"] for i, b in enumerate(bom_settings)})
+    st.session_state.bom["N_PCB"] = st.session_state.bom["BOM_id"].map({i: b["n_pcb"] for i, b in enumerate(bom_settings)})
     st.session_state.lib = lib_df
 
-    st.success(f"BOM : {len(bom_raw)} lignes  |  Librairie : {len(lib_df)} composants")
+    st.success(f"{len(bom_files)} BOM : {len(st.session_state.bom)} lignes  |  Librairie : {len(lib_df)} composants")
 
 else:
-    st.info("Charge un BOM et une librairie pour commencer.")
+    st.info("Charge au moins un BOM pour commencer.")
     st.stop()
 
 
@@ -360,9 +419,6 @@ else:
 # ============================================================
 
 st.header("2. Recherche dans la librairie")
-
-st.number_input("Nombre de PCB", min_value=1, value=10, step=1, key="n_pcb",
-                help="Sert à calculer la quantité totale pour vérifier le stock / le palier de prix.")
 
 if st.button("🔍 Lancer la recherche et remplir le BOM", type="primary"):
 
@@ -430,7 +486,7 @@ if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.b
 
     # Colonnes BOM / lib côte à côte pour comparer facilement
     cols_a_montrer = [c for c in [
-        "References",
+        "BOM", "References",
         "Match",
         "Manufacturer Ref", "Lib_Manufacturer_Ref",
         "Value", "Lib_Value",
@@ -448,7 +504,7 @@ if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.b
 
     st.download_button(
         "⬇️ Télécharger le BOM (état actuel)",
-        data=_df_to_excel_bytes(bom.drop(columns=["Statut"], errors="ignore")),
+        data=_df_to_excel_bytes(bom.drop(columns=["Statut", "BOM_id"], errors="ignore")),
         file_name="bom_verifie.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
@@ -482,8 +538,8 @@ if st.button("💰 Mettre à jour les prix et stocks"):
 
 st.header("4. Rapport")
 
-n_pcb = st.session_state.n_pcb
-st.caption(f"Rapport calculé pour {n_pcb} PCB (réglable dans la section 2).")
+n_pcb = int(st.session_state.bom.drop_duplicates("BOM_id")["N_PCB"].sum())
+st.caption(f"Le rapport couvre {n_pcb} PCB au total sur {len(bom_files)} BOM (nombre de PCB réglé par BOM en section 1).")
 top_n = st.number_input("Nombre de lignes dans les classements", min_value=3, max_value=30, value=10, step=1)
 
 if st.button("📊 Générer le rapport"):
@@ -502,7 +558,7 @@ if st.session_state.get("report") is not None:
     total_price = report["total_price"]
 
     c1, c2, c3 = st.columns(3)
-    c1.metric(f"Prix total pour {n_pcb_affiche} PCB", f"{total_price:.2f} €")
+    c1.metric(f"Prix total ({n_pcb_affiche} PCB, {len(bom_files)} BOM)", f"{total_price:.2f} €")
     c2.metric("Lignes OK", (detail["Status"] == "OK").sum())
     c3.metric("Lignes à vérifier", len(missing))
 
@@ -563,5 +619,43 @@ if st.session_state.get("report") is not None:
         "⬇️ Télécharger le rapport (.xlsx)",
         data=report_path.read_bytes(),
         file_name="rapport_bom.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+# ============================================================
+# 5. Liste consolidée des composants (toutes BOM)
+# ============================================================
+
+st.header("5. Liste des composants (toutes BOM)")
+st.caption(
+    "Regroupe les composants identiques de toutes les BOM : quantité totale "
+    "(qté par PCB × nombre de PCB de chaque BOM), BOM concernées, réf LCSC / Mouser, footprint, type."
+)
+
+if st.button("📦 Générer la liste des composants"):
+    st.session_state.components = build_component_list(st.session_state.bom, st.session_state.lib)
+
+if st.session_state.get("components") is not None:
+
+    components, per_bom = st.session_state.components
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Composants distincts", len(components))
+    c2.metric("Quantité totale", int(components["Qté totale"].sum()))
+    c3.metric("Non identifiés", int((components["Statut"] != "OK").sum()))
+
+    st.dataframe(components, use_container_width=True, hide_index=True)
+
+    with st.expander("Détail par BOM"):
+        st.dataframe(per_bom, use_container_width=True, hide_index=True)
+
+    comp_path = st.session_state.workdir / "liste_composants.xlsx"
+    export_component_list_excel(components, per_bom, str(comp_path))
+
+    st.download_button(
+        "⬇️ Télécharger la liste des composants (.xlsx)",
+        data=comp_path.read_bytes(),
+        file_name="liste_composants.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
