@@ -114,7 +114,8 @@ def get_lcsc_price_from_page(product_code, quantite=1):
 
 def Update_Price_Stock(name,nom_feuille = "Feuille 1"):
     wb = openpyxl.load_workbook(name)
-    ws = wb[nom_feuille]
+    # "Feuille 1" si elle existe, sinon la 1re feuille (comme pd.read_excel)
+    ws = wb[nom_feuille] if nom_feuille in wb.sheetnames else wb.worksheets[0]
 
     # on repère la colonne de chaque en-tête (ligne 1) une seule fois
     entetes = {}

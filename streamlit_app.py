@@ -22,6 +22,10 @@ from backend.BOM_function import fill_bom_result, check_bom, _add_comment
 from backend.Pricing_lcsc import Update_Price_Stock, get_lcsc_price_from_page
 from backend.BOM_report import build_bom_report, export_report_excel, _get_quantity_column
 from backend.BOM_components import build_component_list, export_component_list_excel
+from backend.Stock_personnel import (
+    STOCK_COL, read_mouser_file, read_lcsc_file, plan_stock_import, apply_stock_import,
+    already_imported, build_stock_check, export_stock_check_excel,
+)
 
 
 st.set_page_config(page_title="BOM Checker", page_icon="🔧", layout="wide")
@@ -304,6 +308,8 @@ if "pending" not in st.session_state:
     st.session_state.pending = {}
 if "components" not in st.session_state:
     st.session_state.components = None
+if "stock_check" not in st.session_state:
+    st.session_state.stock_check = None
 if "bom_signature" not in st.session_state:
     st.session_state.bom_signature = None
 
@@ -353,7 +359,12 @@ if bom_files:
         st.warning("Deux BOM ont le même nom : donne-leur des noms différents pour les distinguer dans la liste finale.")
 
     if lib_file is not None:
-        lib_path = _save_uploaded_file(lib_file, st.session_state.workdir)
+        lib_path = st.session_state.workdir / lib_file.name
+        lib_key = (lib_file.name, lib_file.size)
+        if st.session_state.get("lib_key") != lib_key:
+            # écrite une seule fois : sinon chaque rerun écraserait prix / stock mis à jour
+            lib_path.write_bytes(lib_file.getbuffer())
+            st.session_state.lib_key = lib_key
         st.caption(f"📚 Librairie utilisée : **{lib_file.name}** (chargée)")
     elif DEFAULT_LIB_PATH.exists():
         # On copie la lib par défaut dans le workdir pour ne jamais modifier
@@ -395,6 +406,7 @@ if bom_files:
             st.session_state.pending = {}
             st.session_state.report = None
             st.session_state.components = None
+            st.session_state.stock_check = None
 
         lib_df = pd.read_excel(lib_path)
 
@@ -657,5 +669,133 @@ if st.session_state.get("components") is not None:
         "⬇️ Télécharger la liste des composants (.xlsx)",
         data=comp_path.read_bytes(),
         file_name="liste_composants.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+# ============================================================
+# 6. Stock personnel (import des commandes Mouser / LCSC)
+# ============================================================
+
+st.header("6. Stock personnel")
+st.caption(
+    f"Importe tes commandes ou paniers Mouser (.xls / .xlsx) et LCSC-JLCPCB (.csv). "
+    f"Les quantités sont **ajoutées** à la colonne « {STOCK_COL} » de la librairie "
+    "(la colonne est créée si elle n'existe pas)."
+)
+
+if st.session_state.get("stock_msg"):
+    st.success(st.session_state.pop("stock_msg"))
+
+c_m, c_l = st.columns(2)
+mouser_files = c_m.file_uploader("Mouser (.xls / .xlsx)", type=["xls", "xlsx"],
+                                 accept_multiple_files=True, key="stock_mouser")
+lcsc_files = c_l.file_uploader("LCSC / JLCPCB (.csv)", type=["csv"],
+                               accept_multiple_files=True, key="stock_lcsc")
+
+if mouser_files or lcsc_files:
+    entries = None
+    try:
+        frames = [read_mouser_file(f, f.name) for f in mouser_files] + \
+                 [read_lcsc_file(f, f.name) for f in lcsc_files]
+        entries = pd.concat(frames, ignore_index=True)
+    except Exception as e:
+        st.error(f"Erreur de lecture : {e}")
+
+    if entries is not None and not entries.empty:
+        plan = plan_stock_import(st.session_state.lib, entries)
+        ok = plan[plan["Statut"] == "OK"]
+        ko = plan[plan["Statut"] != "OK"]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Lignes rapprochées", len(ok))
+        m2.metric("Quantité à ajouter", int(ok["Qty"].sum()))
+        m3.metric("Introuvables dans la lib", len(ko))
+
+        cols_plan = ["Source", "Fournisseur", "Ref", "MPN", "Qty", "Ligne lib (Excel)", "Composant lib",
+                     "Trouvé par", "Stock avant", "Stock après", "Suggestion lib", "Statut"]
+        st.dataframe(plan[cols_plan], use_container_width=True, hide_index=True)
+
+        if not ko.empty:
+            st.warning(
+                f"{len(ko)} ligne(s) introuvable(s) dans la librairie. Regarde la colonne « Suggestion lib » : "
+                "si c'est le même composant, ajoute la réf fournisseur dans la lib puis relance l'import. "
+                "Sinon, coche la case ci-dessous pour les ajouter."
+            )
+        add_missing = st.checkbox("Ajouter à la librairie les composants introuvables (nouvelles lignes en bas)",
+                                  value=False, disabled=ko.empty)
+
+        deja = already_imported(st.session_state.lib_path, [f.name for f in list(mouser_files) + list(lcsc_files)])
+        confirm = True
+        if deja:
+            st.warning("Déjà importé : " + ", ".join(f"{k} ({v})" for k, v in deja.items()) +
+                       ". Un 2e import compterait ces quantités deux fois.")
+            confirm = st.checkbox("Importer quand même")
+
+        if st.button("📥 Ajouter au stock personnel", type="primary", disabled=not confirm):
+            n = apply_stock_import(st.session_state.lib_path, plan, add_missing=add_missing)
+            st.session_state.lib = pd.read_excel(st.session_state.lib_path)
+            st.session_state.stock_check = None
+            st.session_state.stock_msg = f"Stock mis à jour : {n} ligne(s) modifiée(s)/ajoutée(s)."
+            st.rerun()
+
+# Librairie à jour (stock + prix) à télécharger à tout moment
+st.download_button(
+    "⬇️ Télécharger la librairie mise à jour (.xlsx)",
+    data=Path(st.session_state.lib_path).read_bytes(),
+    file_name=Path(st.session_state.lib_path).name,
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    help="Contient la colonne Stock Personnel, les prix à jour et la feuille « Historique stock ». "
+         "Remplace ton fichier de librairie par celui-ci.",
+)
+
+
+# ============================================================
+# 7. Vérification du stock vs BOM
+# ============================================================
+
+st.header("7. Stock vs BOM")
+st.caption("Compare la quantité totale nécessaire (toutes BOM, × nombre de PCB) au stock personnel.")
+
+if st.button("🧮 Vérifier le stock"):
+    comps, per_bom = build_component_list(st.session_state.bom, st.session_state.lib)
+    st.session_state.components = (comps, per_bom)
+    st.session_state.stock_check = build_stock_check(comps, st.session_state.lib)
+
+check = st.session_state.get("stock_check")
+if check is not None:
+
+    if STOCK_COL not in st.session_state.lib.columns:
+        st.warning(f"La librairie n'a pas de colonne « {STOCK_COL} » : tout le stock est considéré à 0.")
+
+    manque = check[check["Manquant"] > 0]
+    cout = manque["Coût du manquant (€)"].sum(skipna=True)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Composants OK", int((check["Statut"] == "OK").sum()))
+    k2.metric("En manque", len(manque))
+    k3.metric("Pièces manquantes", int(manque["Manquant"].sum()))
+    k4.metric("Coût estimé du réassort", f"{cout:.2f} €")
+
+    only_missing = st.checkbox("Afficher uniquement ce qui manque / à vérifier", value=True)
+    vue = check[check["Statut"] != "OK"] if only_missing else check
+
+    def _color_stock(val):
+        if val in ("RIEN EN STOCK", "ABSENT DE LA LIB"):
+            return "background-color: #f8d7da"
+        if val in ("MANQUE", "NON IDENTIFIÉ"):
+            return "background-color: #fff3cd"
+        if val == "OK":
+            return "background-color: #d4edda"
+        return ""
+
+    st.dataframe(vue.style.map(_color_stock, subset=["Statut"]), use_container_width=True, hide_index=True)
+
+    check_path = st.session_state.workdir / "stock_vs_bom.xlsx"
+    export_stock_check_excel(check, str(check_path))
+    st.download_button(
+        "⬇️ Télécharger la vérification du stock (.xlsx)",
+        data=check_path.read_bytes(),
+        file_name="stock_vs_bom.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
