@@ -1,13 +1,12 @@
 """
-Application Streamlit : reprise du workflow du notebook (Notebook_back.ipynb)
+BOM Checker
 
-- Upload BOM + Librairie de composants (.xlsx)
-- Recherche automatique dans la lib (Manufacturer Ref / Footprint / Value)
-- Remplissage du LCSC_part_number + détection des écarts (mismatch, Mouser only...)
-- Affichage côte à côte BOM / composant retenu dans la lib
-- Mise à jour prix/stock (scraping LCSC) sur la librairie
-- Rapport final : prix total pour n PCB, composants à vérifier
-- Téléchargement des fichiers résultats
+Entête : fichiers (BOM, librairie), noms / nombre de PCB, bouton de recherche.
+Onglets (verrouillés tant que les prérequis manquent) :
+  🔍 Résultats BOM        -> BOM vs librairie        (BOM + recherche faite)
+  📦 Composants & stock   -> liste consolidée + stock (BOM + recherche faite)
+  💰 Prix & rapport       -> prix pour n PCB          (BOM + recherche faite)
+  📚 Librairie & stock    -> import commandes / saisie manuelle / prix LCSC (librairie seule)
 """
 
 import io
@@ -21,30 +20,60 @@ from backend.find_component import search_in_lib
 from backend.BOM_function import fill_bom_result, check_bom, _add_comment
 from backend.Pricing_lcsc import Update_Price_Stock, get_lcsc_price_from_page
 from backend.BOM_report import build_bom_report, export_report_excel, _get_quantity_column
-from backend.BOM_components import build_component_list, export_component_list_excel
+from backend.BOM_components import build_component_list
 from backend.Stock_personnel import (
     STOCK_COL, read_mouser_file, read_lcsc_file, plan_stock_import, apply_stock_import,
-    already_imported, build_stock_check, export_stock_check_excel,
+    set_stock_manual, already_imported, build_stock_check, export_stock_check_excel,
 )
 
 
 st.set_page_config(page_title="BOM Checker", page_icon="🔧", layout="wide")
 
 # Librairie par défaut embarquée dans le repo (à côté de streamlit_app.py).
-# L'utilisateur peut la remplacer via l'upload ci-dessous.
 DEFAULT_LIB_PATH = Path(__file__).parent / "lib/Component_library.xlsx"
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+# `use_container_width` est déprécié dans les Streamlit récents (-> width="stretch")
+_ST_VERSION = tuple(int(x) for x in st.__version__.split(".")[:2] if x.isdigit())
+STRETCH = {"width": "stretch"} if _ST_VERSION >= (1, 50) else {"use_container_width": True}
+
+
+# ============================================================
+# Style
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+    .block-container {max-width: 1500px; padding-top: 1.2rem;}
+    .app-hero {padding: 1rem 1.4rem; border-radius: 14px; margin-bottom: .9rem;
+               background: linear-gradient(120deg, #1f6feb 0%, #7c3aed 100%);}
+    .app-hero h1 {margin: 0; padding: 0; font-size: 1.7rem; color: #fff;}
+    .app-hero p {margin: .25rem 0 0; color: rgba(255,255,255,.88); font-size: .95rem;}
+    div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.25); border-radius: 12px;
+                                 padding: .7rem 1rem; background: rgba(128,128,128,.06);}
+    .chip {display: inline-block; padding: .18rem .65rem; border-radius: 999px; font-size: .82rem;
+           margin: .15rem .3rem .15rem 0; font-weight: 500;}
+    .chip-ok {background: rgba(46,160,67,.18); color: #2ea043;}
+    .chip-warn {background: rgba(210,153,34,.20); color: #d29922;}
+    .chip-off {background: rgba(128,128,128,.18); color: #8b949e;}
+    .lock-card {border: 1px dashed rgba(128,128,128,.5); border-radius: 14px; padding: 2rem 1.5rem;
+                text-align: center; background: rgba(128,128,128,.05); margin-top: .5rem;}
+    .lock-card h3 {margin: 0 0 .4rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def chip(text: str, kind: str = "off") -> str:
+    return f'<span class="chip chip-{kind}">{text}</span>'
 
 
 # ============================================================
 # Utilitaires
 # ============================================================
-
-def _save_uploaded_file(uploaded_file, workdir: Path) -> Path:
-    """Sauvegarde un fichier uploadé sur disque (openpyxl a besoin d'un chemin)."""
-    path = workdir / uploaded_file.name
-    path.write_bytes(uploaded_file.getbuffer())
-    return path
-
 
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     buffer = io.BytesIO()
@@ -53,8 +82,16 @@ def _df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+def _is_filled(x) -> bool:
+    return pd.notna(x) and str(x).strip() != ""
+
+
+def _norm(x) -> str:
+    return "" if pd.isna(x) else str(x).strip().lower()
+
+
 def _status_for_display(row: pd.Series) -> str:
-    """Statut simple pour un aperçu rapide ligne par ligne (avant le rapport final)."""
+    """Statut simple pour un aperçu rapide ligne par ligne."""
     lcsc = row.get("LCSC_part_number")
     comments = str(row.get("Comments", "")) if pd.notna(row.get("Comments")) else ""
 
@@ -67,13 +104,7 @@ def _status_for_display(row: pd.Series) -> str:
 
 def describe_match(result) -> dict:
     """Résume le(s) composant(s) trouvé(s) dans la lib pour une ligne de BOM."""
-    vide = {
-        "Nb_matches": 0,
-        "Lib_Manufacturer_Ref": "",
-        "Lib_Value": "",
-        "Lib_Footprint": "",
-        "Lib_LCSC": "",
-    }
+    vide = {"Nb_matches": 0, "Lib_Manufacturer_Ref": "", "Lib_Value": "", "Lib_Footprint": "", "Lib_LCSC": ""}
     if result is None or result.empty:
         return vide
 
@@ -95,12 +126,7 @@ def describe_match(result) -> dict:
     }
 
 
-def _norm(x) -> str:
-    return "" if pd.isna(x) else str(x).strip().lower()
-
-
 def match_verdict(row) -> str:
-    """Verdict simple sur la correspondance BOM <-> lib."""
     n = row.get("Nb_matches", 0)
     if n == 0:
         return "❌ Aucun"
@@ -114,17 +140,39 @@ def match_verdict(row) -> str:
 def _color_match(val):
     if isinstance(val, str):
         if val.startswith("✅"):
-            return "background-color: #d4edda"
+            return "background-color: #d4edda; color: #1b4332"
         if val.startswith(("🔶", "❓")):
-            return "background-color: #fff3cd"
+            return "background-color: #fff3cd; color: #664d03"
         if val.startswith("❌"):
-            return "background-color: #f8d7da"
+            return "background-color: #f8d7da; color: #58151c"
     return ""
 
 
+def _color_stock(val):
+    if val in ("RIEN EN STOCK", "ABSENT DE LA LIB"):
+        return "background-color: #f8d7da; color: #58151c"
+    if val in ("MANQUE", "NON IDENTIFIÉ"):
+        return "background-color: #fff3cd; color: #664d03"
+    if val == "OK":
+        return "background-color: #d4edda; color: #1b4332"
+    return ""
+
+
+def _prepare_bom_frame(raw: pd.DataFrame, i: int) -> pd.DataFrame:
+    if "Row" in raw.columns:
+        raw = raw.drop(columns=["Row"])
+    if "LCSC_part_number" not in raw.columns:
+        raw["LCSC_part_number"] = pd.NA
+    if "Comments" not in raw.columns:
+        raw["Comments"] = pd.NA
+    raw["LCSC_part_number"] = raw["LCSC_part_number"].astype("object")
+    raw["Comments"] = raw["Comments"].astype("object")
+    raw["BOM_id"] = i
+    return raw
+
 
 # ============================================================
-# Choix d'un composant quand plusieurs candidats identiques (pop-up)
+# Choix d'un composant quand plusieurs candidats (pop-up)
 # ============================================================
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -134,10 +182,6 @@ def _live_lcsc(ref: str, qty: int):
         return get_lcsc_price_from_page(ref, qty)
     except Exception:
         return None
-
-
-def _is_filled(x) -> bool:
-    return pd.notna(x) and str(x).strip() != ""
 
 
 def _candidate_table(cands: pd.DataFrame, qty_total: int) -> pd.DataFrame:
@@ -194,8 +238,7 @@ def _apply_choice(index, chosen: pd.Series):
     else:
         mouser = chosen.get("reference_Mouser")
         msg = f"NO LCSC REF - MOUSER: {mouser}" if _is_filled(mouser) else "NO LCSC REF"
-        line = _add_comment(bom.loc[index].copy(), msg)
-        bom.loc[index] = line
+        bom.loc[index] = _add_comment(bom.loc[index].copy(), msg)
 
     if st.session_state.matches is not None:
         for k, v in describe_match(chosen.to_frame().T).items():
@@ -208,7 +251,6 @@ def _signature(line) -> tuple:
 
 
 def _qty_total_for(bom: pd.DataFrame, idx) -> float:
-    """Quantité par PCB x nombre de PCB de la BOM de cette ligne."""
     qty_col = _get_quantity_column(bom)
     q = pd.to_numeric(bom.loc[idx, qty_col], errors="coerce") if qty_col else 1
     q = 1 if pd.isna(q) else q
@@ -246,7 +288,7 @@ def choose_component_dialog():
     with st.spinner("Vérification prix / stock sur LCSC..."):
         table = _candidate_table(cands, qty_total)
 
-    st.dataframe(table.drop(columns=["_lib_idx"]), hide_index=True, use_container_width=True)
+    st.dataframe(table.drop(columns=["_lib_idx"]), hide_index=True, **STRETCH)
 
     refs = table["LCSC"].replace("", pd.NA).dropna()
     if refs.duplicated().any():
@@ -257,32 +299,27 @@ def choose_component_dialog():
         r = table.iloc[i]
         prix = "prix ?" if pd.isna(r["Prix unitaire (€)"]) else f"{r['Prix unitaire (€)']:.4f} €"
         stock = "stock ?" if pd.isna(r["Stock"]) else f"stock {int(r['Stock'])}"
-        return f"Lib l.{r['Ligne lib (Excel)']}  |  {r['Manufacturer Ref']}  |  {r['LCSC'] or 'sans LCSC'}  |  {prix}  |  {stock}  {r['Stock suffisant']}"
+        return (f"Lib l.{r['Ligne lib (Excel)']}  |  {r['Manufacturer Ref']}  |  "
+                f"{r['LCSC'] or 'sans LCSC'}  |  {prix}  |  {stock}  {r['Stock suffisant']}")
 
     reco = _recommend(table, qty_total)
     st.caption("Présélection : le moins cher parmi ceux dont le stock couvre la quantité.")
-    choice = st.radio(
-        "Composant retenu",
-        options=list(range(len(table))),
-        index=reco,
-        format_func=_label,
-        key=f"choice_{index}",
-    )
+    choice = st.radio("Composant retenu", options=list(range(len(table))), index=reco,
+                      format_func=_label, key=f"choice_{index}")
 
     def _done():
         for k in group:
             pending.pop(k, None)
-        # on enchaîne sur la ligne suivante
-        st.session_state.auto_open_dialog = bool(pending)
+        st.session_state.auto_open_dialog = bool(pending)   # on enchaîne sur la ligne suivante
         st.rerun()
 
     c_ok, c_skip = st.columns(2)
-    if c_ok.button("✅ Valider ce composant", type="primary", use_container_width=True):
+    if c_ok.button("✅ Valider ce composant", type="primary", **STRETCH):
         chosen = cands.loc[table.iloc[choice]["_lib_idx"]]
         for k in group:
             _apply_choice(k, chosen)
         _done()
-    if c_skip.button("⏭️ Ignorer (laisser vide)", use_container_width=True):
+    if c_skip.button("⏭️ Ignorer (laisser vide)", **STRETCH):
         _done()
 
 
@@ -290,157 +327,26 @@ def choose_component_dialog():
 # Etat de session
 # ============================================================
 
-if "workdir" not in st.session_state:
+_defaults = {
+    "workdir": None, "bom_raw": None, "bom": None, "bom_signature": None,
+    "lib_path": None, "lib_key": None, "lib": None,
+    "matches": None, "pending": {}, "nav": "library",
+}
+for _k, _v in _defaults.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+if st.session_state.workdir is None:
     st.session_state.workdir = Path(tempfile.mkdtemp(prefix="bom_checker_"))
-if "bom" not in st.session_state:
-    st.session_state.bom = None
-if "lib_path" not in st.session_state:
-    st.session_state.lib_path = None
-if "lib" not in st.session_state:
-    st.session_state.lib = None
-if "matches" not in st.session_state:
-    st.session_state.matches = None
-if "prices_updated" not in st.session_state:
-    st.session_state.prices_updated = False
-if "report" not in st.session_state:
-    st.session_state.report = None
-if "pending" not in st.session_state:
-    st.session_state.pending = {}
-if "components" not in st.session_state:
-    st.session_state.components = None
-if "stock_check" not in st.session_state:
-    st.session_state.stock_check = None
-if "bom_signature" not in st.session_state:
-    st.session_state.bom_signature = None
 
 
-st.title("🔧 BOM Checker")
-st.caption("Recherche des composants dans la librairie, vérification des références, prix pour n PCB.")
-
-
-# ============================================================
-# 1. Upload des fichiers
-# ============================================================
-
-st.header("1. Fichiers")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    bom_files = st.file_uploader("BOM (.xlsx) — une ou plusieurs", type=["xlsx"], accept_multiple_files=True)
-    header_row = 7
-
-with col2:
-    lib_file = st.file_uploader(
-        "Librairie de composants (.xlsx) — optionnel",
-        type=["xlsx"],
-        help="Par défaut, la librairie du projet (Component_library.xlsx) est utilisée. "
-             "Charge un fichier ici pour la remplacer.",
-    )
-
-if bom_files:
-
-    # Nom + nombre de PCB pour chaque BOM
-    st.subheader("Nom et nombre de PCB de chaque BOM")
-    bom_settings = []
-    for i, f in enumerate(bom_files):
-        c_name, c_n = st.columns([3, 1])
-        name = c_name.text_input(
-            f"Nom attribué à « {f.name} »", value=Path(f.name).stem, key=f"bom_name_{i}_{f.name}_{f.size}"
-        )
-        n = c_n.number_input(
-            "Nb de PCB", min_value=1, value=10, step=1, key=f"bom_npcb_{i}_{f.name}_{f.size}",
-            help="Sert aux quantités totales, au stock à vérifier et au prix.",
-        )
-        bom_settings.append({"name": name.strip() or Path(f.name).stem, "n_pcb": int(n)})
-
-    noms = [b["name"] for b in bom_settings]
-    if len(set(noms)) < len(noms):
-        st.warning("Deux BOM ont le même nom : donne-leur des noms différents pour les distinguer dans la liste finale.")
-
-    if lib_file is not None:
-        lib_path = st.session_state.workdir / lib_file.name
-        lib_key = (lib_file.name, lib_file.size)
-        if st.session_state.get("lib_key") != lib_key:
-            # écrite une seule fois : sinon chaque rerun écraserait prix / stock mis à jour
-            lib_path.write_bytes(lib_file.getbuffer())
-            st.session_state.lib_key = lib_key
-        st.caption(f"📚 Librairie utilisée : **{lib_file.name}** (chargée)")
-    elif DEFAULT_LIB_PATH.exists():
-        # On copie la lib par défaut dans le workdir pour ne jamais modifier
-        # le fichier du repo (Update_Price_Stock écrit dans le fichier).
-        lib_path = st.session_state.workdir / DEFAULT_LIB_PATH.name
-        if not lib_path.exists():
-            lib_path.write_bytes(DEFAULT_LIB_PATH.read_bytes())
-        st.caption(f"📚 Librairie utilisée : **{DEFAULT_LIB_PATH.name}** (par défaut, celle du projet)")
-    else:
-        st.error(
-            f"Aucune librairie chargée et {DEFAULT_LIB_PATH.name} introuvable dans le projet. "
-            "Charge un fichier librairie."
-        )
-        st.stop()
-
-    st.session_state.lib_path = lib_path
-
-    try:
-        # On (re)construit le BOM combiné seulement si les fichiers ont changé
-        signature = tuple((f.name, f.size) for f in bom_files)
-        if st.session_state.bom_signature != signature:
-            frames = []
-            for i, f in enumerate(bom_files):
-                raw = pd.read_excel(f, header=header_row).dropna(how="all")
-                if "Row" in raw.columns:
-                    raw = raw.drop(columns=["Row"])
-                if "LCSC_part_number" not in raw.columns:
-                    raw["LCSC_part_number"] = pd.NA
-                if "Comments" not in raw.columns:
-                    raw["Comments"] = pd.NA
-                raw["LCSC_part_number"] = raw["LCSC_part_number"].astype("object")
-                raw["Comments"] = raw["Comments"].astype("object")
-                raw["BOM_id"] = i
-                frames.append(raw)
-
-            st.session_state.bom = pd.concat(frames, ignore_index=True)
-            st.session_state.bom_signature = signature
-            st.session_state.matches = None
-            st.session_state.pending = {}
-            st.session_state.report = None
-            st.session_state.components = None
-            st.session_state.stock_check = None
-
-        lib_df = pd.read_excel(lib_path)
-
-    except Exception as e:
-        st.error(f"Erreur de lecture des fichiers : {e}")
-        st.stop()
-
-    # Nom / nb de PCB modifiables à tout moment sans perdre la recherche déjà faite
-    st.session_state.bom["BOM"] = st.session_state.bom["BOM_id"].map({i: b["name"] for i, b in enumerate(bom_settings)})
-    st.session_state.bom["N_PCB"] = st.session_state.bom["BOM_id"].map({i: b["n_pcb"] for i, b in enumerate(bom_settings)})
-    st.session_state.lib = lib_df
-
-    st.success(f"{len(bom_files)} BOM : {len(st.session_state.bom)} lignes  |  Librairie : {len(lib_df)} composants")
-
-else:
-    st.info("Charge au moins un BOM pour commencer.")
-    st.stop()
-
-
-# ============================================================
-# 2. Recherche + remplissage du LCSC
-# ============================================================
-
-st.header("2. Recherche dans la librairie")
-
-if st.button("🔍 Lancer la recherche et remplir le BOM", type="primary"):
-
-    bom = st.session_state.bom.copy()
+def run_search():
+    """Recherche chaque ligne du BOM dans la lib (repart toujours du BOM d'origine)."""
+    bom = st.session_state.bom_raw.copy()
     lib = st.session_state.lib
 
     progress = st.progress(0, text="Recherche en cours...")
-    nb = len(bom)
-    matches = {}
-    pending = {}
+    nb = max(len(bom), 1)
+    matches, pending = {}, {}
 
     for i, (index, row) in enumerate(bom.iterrows()):
         result = search_in_lib(lib, row)
@@ -449,43 +355,228 @@ if st.button("🔍 Lancer la recherche et remplir le BOM", type="primary"):
         row = check_bom(row, result)
         bom.loc[index] = row
 
-        # Plusieurs candidats (après dédoublonnage) et rien de rempli -> choix manuel
-        if (
-            result is not None and len(result) > 1
-            and not _is_filled(row.get("LCSC_part_number"))
-        ):
+        # Plusieurs candidats et rien de rempli -> choix manuel (pop-up)
+        if result is not None and len(result) > 1 and not _is_filled(row.get("LCSC_part_number")):
             pending[index] = result
 
-        progress.progress((i + 1) / nb, text=f"Ligne {i + 1}/{nb}")
+        progress.progress((i + 1) / nb, text=f"Ligne {i + 1}/{len(bom)}")
 
     progress.empty()
     st.session_state.bom = bom
     st.session_state.matches = pd.DataFrame.from_dict(matches, orient="index")
     st.session_state.pending = pending
     st.session_state.auto_open_dialog = bool(pending)
-    st.success("Recherche terminée.")
+    st.session_state.nav = "results"
 
-if st.session_state.pending:
-    st.warning(f"{len(st.session_state.pending)} ligne(s) avec plusieurs composants possibles : "
-               "à choisir selon le prix et le stock.")
-    if st.button("🧩 Choisir les composants") or st.session_state.pop("auto_open_dialog", False):
+
+# ============================================================
+# ENTÊTE : fichiers + recherche
+# ============================================================
+
+st.markdown(
+    '<div class="app-hero"><h1>🔧 BOM Checker</h1>'
+    "<p>Retrouve tes composants dans la librairie, calcule le prix et vérifie ton stock.</p></div>",
+    unsafe_allow_html=True,
+)
+
+with st.container(border=True):
+
+    c_bom, c_lib = st.columns(2)
+
+    with c_bom:
+        bom_files = st.file_uploader("BOM (.xlsx) — une ou plusieurs", type=["xlsx"], accept_multiple_files=True)
+
+    with c_lib:
+        lib_file = st.file_uploader(
+            "Librairie de composants (.xlsx) — optionnel", type=["xlsx"],
+            help="Par défaut, la librairie du projet est utilisée. Charge un fichier pour la remplacer.",
+        )
+
+    # ---- Librairie (chargée même sans BOM) ----
+    if lib_file is not None:
+        lib_path = st.session_state.workdir / lib_file.name
+        lib_key = (lib_file.name, lib_file.size)
+        if st.session_state.lib_key != lib_key:
+            lib_path.write_bytes(lib_file.getbuffer())   # écrite une seule fois (sinon prix/stock écrasés)
+            st.session_state.matches = None              # la recherche dépendait de l'ancienne lib
+            st.session_state.pending = {}
+            st.session_state.lib_key = lib_key
+        lib_label = f"{lib_file.name} (chargée)"
+    elif DEFAULT_LIB_PATH.exists():
+        # copie de travail : Update_Price_Stock / import de stock écrivent dans le fichier
+        lib_path = st.session_state.workdir / DEFAULT_LIB_PATH.name
+        if not lib_path.exists():
+            lib_path.write_bytes(DEFAULT_LIB_PATH.read_bytes())
+        if st.session_state.lib_key is not None:         # retour à la lib par défaut
+            st.session_state.lib_key = None
+            st.session_state.matches = None
+            st.session_state.pending = {}
+        lib_label = f"{DEFAULT_LIB_PATH.name} (préinstallée)"
+    else:
+        lib_path, lib_label = None, None
+
+    if lib_path is None:
+        st.error(f"Aucune librairie : {DEFAULT_LIB_PATH.name} introuvable dans le projet. Charge un fichier librairie.")
+        st.stop()
+
+    try:
+        st.session_state.lib = pd.read_excel(lib_path)
+        st.session_state.lib_path = lib_path
+    except Exception as e:
+        st.error(f"Erreur de lecture de la librairie : {e}")
+        st.stop()
+
+    # ---- BOM ----
+    bom_settings = []
+    if bom_files:
+        with st.expander("Nom et nombre de PCB de chaque BOM", expanded=True):
+            for i, f in enumerate(bom_files):
+                c_name, c_n = st.columns([3, 1])
+                name = c_name.text_input(
+                    f"Nom attribué à « {f.name} »", value=Path(f.name).stem,
+                    key=f"bom_name_{i}_{f.name}_{f.size}",
+                )
+                n = c_n.number_input(
+                    "Nb de PCB", min_value=1, value=10, step=1, key=f"bom_npcb_{i}_{f.name}_{f.size}",
+                    help="Sert aux quantités totales, au stock à vérifier et au prix.",
+                )
+                bom_settings.append({"name": name.strip() or Path(f.name).stem, "n_pcb": int(n)})
+
+            noms = [b["name"] for b in bom_settings]
+            if len(set(noms)) < len(noms):
+                st.warning("Deux BOM ont le même nom : donne-leur des noms différents.")
+
+        signature = tuple((f.name, f.size) for f in bom_files)
+        if st.session_state.bom_signature != signature:
+            try:
+                frames = [_prepare_bom_frame(pd.read_excel(f, header=7).dropna(how="all"), i)
+                          for i, f in enumerate(bom_files)]
+            except Exception as e:
+                st.error(f"Erreur de lecture du BOM : {e}")
+                st.stop()
+            raw = pd.concat(frames, ignore_index=True)
+            st.session_state.bom_raw = raw
+            st.session_state.bom = raw.copy()
+            st.session_state.bom_signature = signature
+            st.session_state.matches = None
+            st.session_state.pending = {}
+
+        # Nom / nb de PCB modifiables à tout moment sans perdre la recherche
+        names = {i: b["name"] for i, b in enumerate(bom_settings)}
+        npcbs = {i: b["n_pcb"] for i, b in enumerate(bom_settings)}
+        for key in ("bom_raw", "bom"):
+            st.session_state[key]["BOM"] = st.session_state[key]["BOM_id"].map(names)
+            st.session_state[key]["N_PCB"] = st.session_state[key]["BOM_id"].map(npcbs)
+
+    elif st.session_state.bom_signature is not None:
+        # BOM retirés : on remet tout à zéro (onglets BOM re-verrouillés)
+        for key in ("bom_raw", "bom", "bom_signature", "matches"):
+            st.session_state[key] = None
+        st.session_state.pending = {}
+
+    has_bom = st.session_state.bom_raw is not None
+    searched = has_bom and st.session_state.matches is not None
+    n_pending = len(st.session_state.pending)
+
+    # ---- Statut + bouton de recherche ----
+    c_status, c_btn = st.columns([3, 1.2], vertical_alignment="center")
+
+    with c_btn:
+        if st.button("🔍 Lancer la recherche", type="primary", **STRETCH, disabled=not has_bom,
+                     help="Obligatoire pour débloquer les onglets liés au BOM."):
+            run_search()
+            searched, n_pending = True, len(st.session_state.pending)
+        if n_pending:
+            if st.button(f"🧩 {n_pending} à trancher", **STRETCH):
+                st.session_state.auto_open_dialog = True
+
+    with c_status:
+        chips = chip(f"📚 Librairie : {lib_label} · {len(st.session_state.lib)} composants", "ok")
+        if has_bom:
+            chips += chip(f"📄 {len(bom_files)} BOM · {len(st.session_state.bom_raw)} lignes", "ok")
+        else:
+            chips += chip("📄 Aucun BOM chargé", "off")
+        if searched:
+            chips += chip("🔍 Recherche faite", "ok")
+        elif has_bom:
+            chips += chip("🔍 Recherche à lancer", "warn")
+        else:
+            chips += chip("🔍 Recherche en attente d'un BOM", "off")
+        if n_pending:
+            chips += chip(f"🧩 {n_pending} ligne(s) à trancher", "warn")
+        st.markdown(chips, unsafe_allow_html=True)
+
+    if st.session_state.pending and st.session_state.pop("auto_open_dialog", False):
         choose_component_dialog()
 
-if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.bom.columns:
 
+# ============================================================
+# NAVIGATION (onglets verrouillables)
+# ============================================================
+
+TABS = {
+    "results":    {"icon": "🔍", "label": "Résultats BOM",       "needs_bom": True},
+    "components": {"icon": "📦", "label": "Composants & stock",  "needs_bom": True},
+    "report":     {"icon": "💰", "label": "Prix & rapport",      "needs_bom": True},
+    "library":    {"icon": "📚", "label": "Librairie & stock",   "needs_bom": False},
+}
+
+
+def _is_locked(key: str) -> bool:
+    return TABS[key]["needs_bom"] and not searched
+
+
+def _tab_label(key: str) -> str:
+    return f"{'🔒' if _is_locked(key) else TABS[key]['icon']} {TABS[key]['label']}"
+
+
+keys = list(TABS)
+if st.session_state.nav not in keys:   # ex. clic sur l'onglet déjà actif (désélection)
+    st.session_state.nav = st.session_state.get("_last_nav", "library")
+
+if hasattr(st, "segmented_control"):
+    selected = st.segmented_control("Navigation", keys, format_func=_tab_label, key="nav",
+                                    label_visibility="collapsed")
+else:  # Streamlit plus ancien
+    selected = st.radio("Navigation", keys, format_func=_tab_label, key="nav", horizontal=True,
+                        label_visibility="collapsed")
+selected = selected or st.session_state.get("_last_nav", "library")   # clic sur l'onglet déjà actif
+st.session_state["_last_nav"] = selected
+
+
+def lock_card(missing: list):
+    items = "<br>".join(f"• {m}" for m in missing)
+    st.markdown(
+        f'<div class="lock-card"><h3>🔒 Onglet verrouillé</h3>'
+        f"<div>Pour le débloquer :<br>{items}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def missing_for_bom_tabs() -> list:
+    out = []
+    if not has_bom:
+        out.append("charge au moins un BOM (en haut)")
+    out.append("lance la recherche (bouton « 🔍 Lancer la recherche » en haut)")
+    return out
+
+
+# ============================================================
+# ONGLET : Résultats BOM
+# ============================================================
+
+def tab_results():
     bom = st.session_state.bom
+    matches = st.session_state.matches
 
     apercu = bom.copy()
     apercu["Statut"] = apercu.apply(_status_for_display, axis=1)
+    apercu = apercu.join(matches)
+    apercu["Match"] = apercu.apply(match_verdict, axis=1)
 
-    matches = st.session_state.get("matches")
-    if matches is not None:
-        apercu = apercu.join(matches)
-        apercu["Match"] = apercu.apply(match_verdict, axis=1)
-
-    nb_ok = (apercu["Statut"] == "✅ OK").sum()
-    nb_warn = apercu["Statut"].str.startswith("⚠️").sum()
-    nb_ko = (apercu["Statut"] == "❌ Non détecté").sum()
+    nb_ok = int((apercu["Statut"] == "✅ OK").sum())
+    nb_warn = int(apercu["Statut"].str.startswith("⚠️").sum())
+    nb_ko = int((apercu["Statut"] == "❌ Non détecté").sum())
 
     c1, c2, c3 = st.columns(3)
     c1.metric("OK", nb_ok)
@@ -493,13 +584,11 @@ if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.b
     c3.metric("Non détecté", nb_ko)
 
     only_check = st.checkbox("Afficher uniquement les lignes à vérifier")
-    if only_check and "Match" in apercu.columns:
+    if only_check:
         apercu = apercu[apercu["Match"] != "✅ Identique"]
 
-    # Colonnes BOM / lib côte à côte pour comparer facilement
-    cols_a_montrer = [c for c in [
-        "BOM", "References",
-        "Match",
+    cols = [c for c in [
+        "BOM", "References", "Match",
         "Manufacturer Ref", "Lib_Manufacturer_Ref",
         "Value", "Lib_Value",
         "Footprint", "Lib_Footprint",
@@ -507,308 +596,293 @@ if st.session_state.bom is not None and "LCSC_part_number" in st.session_state.b
         "Nb_matches", "Comments", "Statut",
     ] if c in apercu.columns]
 
-    tableau = apercu[cols_a_montrer]
-    if "Match" in tableau.columns:
-        # pandas < 2.1 : remplacer .map par .applymap
-        tableau = tableau.style.map(_color_match, subset=["Match"])
-
-    st.dataframe(tableau, use_container_width=True, height=400)
+    st.dataframe(apercu[cols].style.map(_color_match, subset=["Match"]), **STRETCH, height=460)
 
     st.download_button(
-        "⬇️ Télécharger le BOM (état actuel)",
-        data=_df_to_excel_bytes(bom.drop(columns=["Statut", "BOM_id"], errors="ignore")),
-        file_name="bom_verifie.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "⬇️ Télécharger le BOM vérifié",
+        data=_df_to_excel_bytes(bom.drop(columns=["BOM_id"], errors="ignore")),
+        file_name="bom_verifie.xlsx", mime=XLSX_MIME,
     )
 
 
 # ============================================================
-# 3. Mise à jour prix / stock (scraping LCSC)
+# ONGLET : Composants & stock (liste consolidée + stock)
 # ============================================================
 
-st.header("3. Prix & stock")
+def tab_components():
+    bom, lib = st.session_state.bom, st.session_state.lib
 
-st.caption(
-    "Interroge LCSC.com pour chaque composant de la librairie (1 requête/seconde). "
-    "Peut prendre plusieurs minutes selon la taille de la librairie."
-)
+    comps, per_bom = build_component_list(bom, lib)
+    check = build_stock_check(comps, lib)
 
-if st.button("💰 Mettre à jour les prix et stocks"):
-    with st.spinner("Récupération des prix sur LCSC..."):
-        try:
-            Update_Price_Stock(str(st.session_state.lib_path))
-            st.session_state.lib = pd.read_excel(st.session_state.lib_path)
-            st.session_state.prices_updated = True
-            st.success("Prix et stocks mis à jour.")
-        except Exception as e:
-            st.error(f"Erreur pendant la mise à jour : {e}")
+    if STOCK_COL not in lib.columns:
+        st.warning(f"La librairie n'a pas de colonne « {STOCK_COL} » : tout le stock est considéré à 0. "
+                   "Ajoute du stock dans l'onglet 📚 Librairie & stock.")
+
+    manque = check[check["Manquant"].fillna(0) > 0]
+    cout = manque["Coût du manquant (€)"].sum(skipna=True)
+    nb_unknown = int((check["Statut"] == "NON IDENTIFIÉ").sum())
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Composants distincts", len(check))
+    k2.metric("OK", int((check["Statut"] == "OK").sum()))
+    k3.metric("En manque", len(manque))
+    k4.metric("Pièces manquantes", int(manque["Manquant"].sum()))
+    k5.metric("Coût du réassort", f"{cout:.2f} €")
+
+    if nb_unknown:
+        st.warning(f"{nb_unknown} ligne(s) du BOM ne sont pas rattachées à la librairie (NON IDENTIFIÉ) : "
+                   "leur stock n'est pas vérifié. Résous-les via « 🧩 à trancher » en haut, ou ajoute-les à la lib.")
+
+    f1, f2 = st.columns([1.2, 2])
+    vue_mode = f1.radio("Afficher", ["À traiter", "Tout", "OK"], horizontal=True, key="comp_view")
+    q = f2.text_input("🔎 Filtrer", placeholder="composant, valeur, type, BOM, réf LCSC / Mouser…", key="comp_q")
+
+    vue = check
+    if vue_mode == "À traiter":
+        vue = vue[vue["Statut"] != "OK"]
+    elif vue_mode == "OK":
+        vue = vue[vue["Statut"] == "OK"]
+    if q:
+        mask = vue.astype(str).apply(lambda c: c.str.contains(q, case=False, na=False, regex=False)).any(axis=1)
+        vue = vue[mask]
+
+    cols = ["Statut", "Composant", "Valeur", "Description", "Type", "Footprint", "Ref LCSC", "Ref Mouser",
+            "BOM concernées", "Qté par BOM", "Besoin", "Stock perso", "Manquant",
+            "Prix unitaire (€)", "Coût du manquant (€)", "Ligne lib (Excel)"]
+    st.dataframe(vue[cols].style.map(_color_stock, subset=["Statut"]), **STRETCH,
+                 hide_index=True, height=460)
+
+    buf = io.BytesIO()
+    export_stock_check_excel(check, buf, per_bom=per_bom)
+    st.download_button("⬇️ Télécharger la liste (composants, stock, à commander)", data=buf.getvalue(),
+                       file_name="composants_stock.xlsx", mime=XLSX_MIME)
 
 
 # ============================================================
-# 4. Rapport final
+# ONGLET : Prix & rapport
 # ============================================================
 
-st.header("4. Rapport")
+def tab_report():
+    bom, lib = st.session_state.bom, st.session_state.lib
 
-n_pcb = int(st.session_state.bom.drop_duplicates("BOM_id")["N_PCB"].sum())
-st.caption(f"Le rapport couvre {n_pcb} PCB au total sur {len(bom_files)} BOM (nombre de PCB réglé par BOM en section 1).")
-top_n = st.number_input("Nombre de lignes dans les classements", min_value=3, max_value=30, value=10, step=1)
+    n_pcb = int(st.session_state.bom_raw.drop_duplicates("BOM_id")["N_PCB"].sum())
+    c_info, c_top = st.columns([3, 1])
+    c_info.caption(f"Le rapport couvre {n_pcb} PCB au total sur {st.session_state.bom_raw['BOM_id'].nunique()} BOM "
+                   "(nombre de PCB réglé par BOM dans l'entête).")
+    top_n = c_top.number_input("Lignes dans les classements", min_value=3, max_value=30, value=10, step=1)
 
-if st.button("📊 Générer le rapport"):
-    bom = st.session_state.bom
-    lib = st.session_state.lib
-    st.session_state.report = build_bom_report(bom, lib, n_pcb=n_pcb, top_n=top_n)
-    st.session_state.report_n_pcb = n_pcb
+    if "Price" not in lib.columns or pd.to_numeric(lib["Price"], errors="coerce").notna().sum() == 0:
+        st.warning("Aucun prix dans la librairie. Lance « Mettre à jour les prix » dans l'onglet 📚 Librairie & stock.")
 
-if st.session_state.get("report") is not None:
-
-    report = st.session_state.report
-    n_pcb_affiche = st.session_state.get("report_n_pcb", n_pcb)
-
-    detail = report["detail"]
-    missing = report["missing"]
-    total_price = report["total_price"]
+    report = build_bom_report(bom, lib, n_pcb=n_pcb, top_n=top_n)
+    detail, missing, total_price = report["detail"], report["missing"], report["total_price"]
 
     c1, c2, c3 = st.columns(3)
-    c1.metric(f"Prix total ({n_pcb_affiche} PCB, {len(bom_files)} BOM)", f"{total_price:.2f} €")
-    c2.metric("Lignes OK", (detail["Status"] == "OK").sum())
+    c1.metric(f"Prix total ({n_pcb} PCB)", f"{total_price:.2f} €")
+    c2.metric("Lignes OK", int((detail["Status"] == "OK").sum()))
     c3.metric("Lignes à vérifier", len(missing))
 
     if not missing.empty:
-        st.subheader("Composants à vérifier")
-        cols = [c for c in [
-            "Manufacturer Ref", "Value", "Footprint",
-            "LCSC_part_number", "Status", "Comments",
-        ] if c in missing.columns]
-        st.dataframe(missing[cols], use_container_width=True)
+        with st.expander(f"Composants à vérifier ({len(missing)})"):
+            cols = [c for c in ["BOM", "Manufacturer Ref", "Value", "Footprint", "LCSC_part_number", "Status", "Comments"]
+                    if c in missing.columns]
+            st.dataframe(missing[cols], **STRETCH, hide_index=True)
     else:
         st.success("Tous les composants sont correctement identifiés.")
 
-    st.divider()
-
     col_a, col_b = st.columns(2)
-
     with col_a:
         st.subheader("💸 Composants les plus chers")
-        top_expensive = report.get("top_expensive")
-        if top_expensive is not None and not top_expensive.empty:
-            st.dataframe(top_expensive, use_container_width=True, hide_index=True)
+        te = report.get("top_expensive")
+        if te is not None and not te.empty:
+            st.dataframe(te, **STRETCH, hide_index=True)
         else:
             st.info("Pas assez de données de prix pour ce classement.")
-
     with col_b:
         st.subheader("🔁 Composants les plus récurrents")
-        most_recurring = report.get("most_recurring")
-        if most_recurring is not None and not most_recurring.empty:
-            st.dataframe(most_recurring, use_container_width=True, hide_index=True)
+        mr = report.get("most_recurring")
+        if mr is not None and not mr.empty:
+            st.dataframe(mr, **STRETCH, hide_index=True)
         else:
             st.info("Pas de colonne Manufacturer Ref pour ce classement.")
 
     st.subheader("🏷️ Coût par famille de composant")
-    cost_by_type = report.get("cost_by_type")
-    if cost_by_type is not None and not cost_by_type.empty:
+    cbt = report.get("cost_by_type")
+    if cbt is not None and not cbt.empty:
         c_chart, c_table = st.columns([2, 1])
-        with c_chart:
-            st.bar_chart(cost_by_type)
-        with c_table:
-            st.dataframe(
-                cost_by_type.rename("Coût total (€)").to_frame(),
-                use_container_width=True,
-            )
+        c_chart.bar_chart(cbt)
+        c_table.dataframe(cbt.rename("Coût total (€)").to_frame(), **STRETCH)
     else:
         st.info("Colonne 'type' absente de la librairie : impossible de grouper par famille.")
 
-    st.divider()
-
     with st.expander("Voir le détail complet"):
-        st.dataframe(detail, use_container_width=True)
+        st.dataframe(detail, **STRETCH)
 
-    # Export Excel du rapport
     report_path = st.session_state.workdir / "rapport_bom.xlsx"
-    export_report_excel(report, str(report_path), n_pcb=n_pcb_affiche)
+    export_report_excel(report, str(report_path), n_pcb=n_pcb)
+    st.download_button("⬇️ Télécharger le rapport (.xlsx)", data=report_path.read_bytes(),
+                       file_name="rapport_bom.xlsx", mime=XLSX_MIME)
 
-    st.download_button(
-        "⬇️ Télécharger le rapport (.xlsx)",
-        data=report_path.read_bytes(),
-        file_name="rapport_bom.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+# ============================================================
+# ONGLET : Librairie & stock
+# ============================================================
+
+SOURCES = ["LCSC / JLCPCB (.csv)", "Mouser (.xls / .xlsx)", "Saisie manuelle"]
+
+
+def _stock_import_block(source: str):
+    """Import d'un fichier de commande (LCSC ou Mouser) avec aperçu avant écriture."""
+    is_lcsc = source.startswith("LCSC")
+    files = st.file_uploader(
+        "Commandes / paniers LCSC-JLCPCB (.csv)" if is_lcsc else "Commandes / paniers Mouser (.xls / .xlsx)",
+        type=["csv"] if is_lcsc else ["xls", "xlsx"],
+        accept_multiple_files=True, key=f"stock_up_{'lcsc' if is_lcsc else 'mouser'}",
     )
+    if not files:
+        st.info("Charge un ou plusieurs fichiers : les quantités seront **ajoutées** au stock personnel.")
+        return
 
-
-# ============================================================
-# 5. Liste consolidée des composants (toutes BOM)
-# ============================================================
-
-st.header("5. Liste des composants (toutes BOM)")
-st.caption(
-    "Regroupe les composants identiques de toutes les BOM : quantité totale "
-    "(qté par PCB × nombre de PCB de chaque BOM), BOM concernées, réf LCSC / Mouser, footprint, type."
-)
-
-if st.button("📦 Générer la liste des composants"):
-    st.session_state.components = build_component_list(st.session_state.bom, st.session_state.lib)
-
-if st.session_state.get("components") is not None:
-
-    components, per_bom = st.session_state.components
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Composants distincts", len(components))
-    c2.metric("Quantité totale", int(components["Qté totale"].sum()))
-    c3.metric("Non identifiés", int((components["Statut"] != "OK").sum()))
-
-    st.dataframe(components, use_container_width=True, hide_index=True)
-
-    with st.expander("Détail par BOM"):
-        st.dataframe(per_bom, use_container_width=True, hide_index=True)
-
-    comp_path = st.session_state.workdir / "liste_composants.xlsx"
-    export_component_list_excel(components, per_bom, str(comp_path))
-
-    st.download_button(
-        "⬇️ Télécharger la liste des composants (.xlsx)",
-        data=comp_path.read_bytes(),
-        file_name="liste_composants.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-# ============================================================
-# 6. Stock personnel (import des commandes Mouser / LCSC)
-# ============================================================
-
-st.header("6. Stock personnel")
-st.caption(
-    f"Importe tes commandes ou paniers Mouser (.xls / .xlsx) et LCSC-JLCPCB (.csv). "
-    f"Les quantités sont **ajoutées** à la colonne « {STOCK_COL} » de la librairie "
-    "(la colonne est créée si elle n'existe pas)."
-)
-
-if st.session_state.get("stock_msg"):
-    st.success(st.session_state.pop("stock_msg"))
-
-c_m, c_l = st.columns(2)
-mouser_files = c_m.file_uploader("Mouser (.xls / .xlsx)", type=["xls", "xlsx"],
-                                 accept_multiple_files=True, key="stock_mouser")
-lcsc_files = c_l.file_uploader("LCSC / JLCPCB (.csv)", type=["csv"],
-                               accept_multiple_files=True, key="stock_lcsc")
-
-if mouser_files or lcsc_files:
-    entries = None
     try:
-        frames = [read_mouser_file(f, f.name) for f in mouser_files] + \
-                 [read_lcsc_file(f, f.name) for f in lcsc_files]
-        entries = pd.concat(frames, ignore_index=True)
+        reader = read_lcsc_file if is_lcsc else read_mouser_file
+        entries = pd.concat([reader(f, f.name) for f in files], ignore_index=True)
     except Exception as e:
         st.error(f"Erreur de lecture : {e}")
+        return
+    if entries.empty:
+        st.warning("Aucune ligne exploitable dans ce(s) fichier(s).")
+        return
 
-    if entries is not None and not entries.empty:
-        plan = plan_stock_import(st.session_state.lib, entries)
-        ok = plan[plan["Statut"] == "OK"]
-        ko = plan[plan["Statut"] != "OK"]
+    plan = plan_stock_import(st.session_state.lib, entries)
+    ok, ko = plan[plan["Statut"] == "OK"], plan[plan["Statut"] != "OK"]
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Lignes rapprochées", len(ok))
-        m2.metric("Quantité à ajouter", int(ok["Qty"].sum()))
-        m3.metric("Introuvables dans la lib", len(ko))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Lignes rapprochées", len(ok))
+    m2.metric("Quantité à ajouter", int(ok["Qty"].sum()))
+    m3.metric("Introuvables dans la lib", len(ko))
 
-        cols_plan = ["Source", "Fournisseur", "Ref", "MPN", "Qty", "Ligne lib (Excel)", "Composant lib",
-                     "Trouvé par", "Stock avant", "Stock après", "Suggestion lib", "Statut"]
-        st.dataframe(plan[cols_plan], use_container_width=True, hide_index=True)
+    cols_plan = ["Source", "Ref", "MPN", "Qty", "Ligne lib (Excel)", "Composant lib", "Trouvé par",
+                 "Stock avant", "Stock après", "Suggestion lib", "Statut"]
+    st.dataframe(plan[cols_plan], **STRETCH, hide_index=True)
 
-        if not ko.empty:
-            st.warning(
-                f"{len(ko)} ligne(s) introuvable(s) dans la librairie. Regarde la colonne « Suggestion lib » : "
-                "si c'est le même composant, ajoute la réf fournisseur dans la lib puis relance l'import. "
-                "Sinon, coche la case ci-dessous pour les ajouter."
-            )
-        add_missing = st.checkbox("Ajouter à la librairie les composants introuvables (nouvelles lignes en bas)",
-                                  value=False, disabled=ko.empty)
+    if not ko.empty:
+        st.warning(f"{len(ko)} ligne(s) introuvable(s) dans la librairie. Regarde « Suggestion lib » : si c'est le même "
+                   "composant, ajoute la réf fournisseur dans la lib puis relance l'import. "
+                   "Sinon, coche la case ci-dessous pour les ajouter.")
+    add_missing = st.checkbox("Ajouter à la librairie les composants introuvables (nouvelles lignes en bas)",
+                              value=False, disabled=ko.empty, key=f"add_missing_{source}")
 
-        deja = already_imported(st.session_state.lib_path, [f.name for f in list(mouser_files) + list(lcsc_files)])
-        confirm = True
-        if deja:
-            st.warning("Déjà importé : " + ", ".join(f"{k} ({v})" for k, v in deja.items()) +
-                       ". Un 2e import compterait ces quantités deux fois.")
-            confirm = st.checkbox("Importer quand même")
+    deja = already_imported(st.session_state.lib_path, [f.name for f in files])
+    confirm = True
+    if deja:
+        st.warning("Déjà importé : " + ", ".join(f"{k} ({v})" for k, v in deja.items()) +
+                   ". Un 2e import compterait ces quantités deux fois.")
+        confirm = st.checkbox("Importer quand même", key=f"force_{source}")
 
-        if st.button("📥 Ajouter au stock personnel", type="primary", disabled=not confirm):
-            n = apply_stock_import(st.session_state.lib_path, plan, add_missing=add_missing)
-            st.session_state.lib = pd.read_excel(st.session_state.lib_path)
-            st.session_state.stock_check = None
-            st.session_state.stock_msg = f"Stock mis à jour : {n} ligne(s) modifiée(s)/ajoutée(s)."
-            st.rerun()
-
-# Librairie à jour (stock + prix) à télécharger à tout moment
-st.download_button(
-    "⬇️ Télécharger la librairie mise à jour (.xlsx)",
-    data=Path(st.session_state.lib_path).read_bytes(),
-    file_name=Path(st.session_state.lib_path).name,
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    help="Contient la colonne Stock Personnel, les prix à jour et la feuille « Historique stock ». "
-         "Remplace ton fichier de librairie par celui-ci.",
-)
+    if st.button("📥 Ajouter au stock personnel", type="primary", disabled=not confirm, key=f"apply_{source}"):
+        n = apply_stock_import(st.session_state.lib_path, plan, add_missing=add_missing)
+        st.session_state.lib = pd.read_excel(st.session_state.lib_path)
+        st.session_state.stock_msg = f"Stock mis à jour : {n} ligne(s) modifiée(s)/ajoutée(s)."
+        st.rerun()
 
 
-# ============================================================
-# 7. Vérification du stock vs BOM
-# ============================================================
+def _stock_manual_block():
+    """Recherche d'un composant dans la lib + édition directe du stock."""
+    lib = st.session_state.lib
 
-st.header("7. Stock vs BOM")
-st.caption("Compare la quantité totale nécessaire (toutes BOM, × nombre de PCB) au stock personnel.")
+    q = st.text_input("🔎 Rechercher un composant dans la librairie",
+                      placeholder="réf fabricant, valeur, description, réf LCSC / Mouser…", key="manual_q")
 
-lib_now = st.session_state.lib
-nb_stock = int(pd.to_numeric(lib_now[STOCK_COL], errors="coerce").notna().sum()) if STOCK_COL in lib_now.columns else 0
-st.caption(f"📚 Librairie utilisée : **{Path(st.session_state.lib_path).name}** — "
-           f"{nb_stock} composant(s) avec un « {STOCK_COL} » renseigné.")
+    search_cols = [c for c in ["Manufacturer Ref", "Value", "description", "Footprint", "type",
+                               "reference_LCSC", "reference_Mouser", "Manufacturer Part"] if c in lib.columns]
+    mask = pd.Series(True, index=lib.index)
+    if q:
+        mask = lib[search_cols].astype(str).apply(
+            lambda c: c.str.contains(q, case=False, na=False, regex=False)).any(axis=1)
 
-if st.session_state.matches is None:
-    st.warning("Lance d'abord la recherche dans la librairie (section 2) : sans elle, les lignes du BOM "
-               "ne sont pas rattachées à la lib et leur stock ne peut pas être vérifié.")
+    show_cols = [c for c in ["Manufacturer Ref", "Value", "Footprint", "type", "reference_LCSC", "reference_Mouser"]
+                 if c in lib.columns]
+    view = lib.loc[mask, show_cols].copy()
+    current = (pd.to_numeric(lib[STOCK_COL], errors="coerce").fillna(0)
+               if STOCK_COL in lib.columns else pd.Series(0.0, index=lib.index))
+    view[STOCK_COL] = current[mask]
 
-if st.button("🧮 Vérifier le stock", disabled=st.session_state.matches is None):
-    comps, per_bom = build_component_list(st.session_state.bom, st.session_state.lib)
-    st.session_state.components = (comps, per_bom)
-    st.session_state.stock_check = build_stock_check(comps, st.session_state.lib)
+    st.caption(f"{len(view)} composant(s) affiché(s). Modifie la colonne « {STOCK_COL} » puis enregistre "
+               "(enregistre avant de changer la recherche).")
 
-check = st.session_state.get("stock_check")
-if check is not None:
-
-    if STOCK_COL not in st.session_state.lib.columns:
-        st.warning(f"La librairie n'a pas de colonne « {STOCK_COL} » : tout le stock est considéré à 0.")
-
-    manque = check[check["Manquant"] > 0]
-    cout = manque["Coût du manquant (€)"].sum(skipna=True)
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Composants OK", int((check["Statut"] == "OK").sum()))
-    k2.metric("En manque", len(manque))
-    nb_unknown = int((check["Statut"] == "NON IDENTIFIÉ").sum())
-    if nb_unknown:
-        st.warning(f"{nb_unknown} ligne(s) du BOM ne sont pas rattachées à la librairie (NON IDENTIFIÉ) : "
-                   "leur stock n'est pas vérifié. Résous-les via la section 2 (pop-up de choix) ou ajoute-les à la lib.")
-    k3.metric("Pièces manquantes", int(manque["Manquant"].sum()))
-    k4.metric("Coût estimé du réassort", f"{cout:.2f} €")
-
-    only_missing = st.checkbox("Afficher uniquement ce qui manque / à vérifier", value=True)
-    vue = check[check["Statut"] != "OK"] if only_missing else check
-
-    def _color_stock(val):
-        if val in ("RIEN EN STOCK", "ABSENT DE LA LIB"):
-            return "background-color: #f8d7da"
-        if val in ("MANQUE", "NON IDENTIFIÉ"):
-            return "background-color: #fff3cd"
-        if val == "OK":
-            return "background-color: #d4edda"
-        return ""
-
-    st.dataframe(vue.style.map(_color_stock, subset=["Statut"]), use_container_width=True, hide_index=True)
-
-    check_path = st.session_state.workdir / "stock_vs_bom.xlsx"
-    export_stock_check_excel(check, str(check_path))
-    st.download_button(
-        "⬇️ Télécharger la vérification du stock (.xlsx)",
-        data=check_path.read_bytes(),
-        file_name="stock_vs_bom.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    edited = st.data_editor(
+        view, hide_index=True, **STRETCH, height=420,
+        disabled=show_cols, key=f"manual_editor_{st.session_state.get('manual_ver', 0)}_{q}",
+        column_config={STOCK_COL: st.column_config.NumberColumn(STOCK_COL, min_value=0, step=1, format="%d")},
     )
+
+    changes = {idx: edited.loc[idx, STOCK_COL] for idx in edited.index
+               if pd.notna(edited.loc[idx, STOCK_COL]) and edited.loc[idx, STOCK_COL] != view.loc[idx, STOCK_COL]}
+
+    if st.button(f"💾 Enregistrer {len(changes)} modification(s)", type="primary", disabled=not changes):
+        n = set_stock_manual(st.session_state.lib_path, lib, changes)
+        st.session_state.lib = pd.read_excel(st.session_state.lib_path)
+        st.session_state.manual_ver = st.session_state.get("manual_ver", 0) + 1
+        st.session_state.stock_msg = f"Stock mis à jour manuellement : {n} composant(s)."
+        st.rerun()
+
+
+def tab_library():
+    lib = st.session_state.lib
+
+    if st.session_state.get("stock_msg"):
+        st.success(st.session_state.pop("stock_msg"))
+
+    nb_stock = int(pd.to_numeric(lib[STOCK_COL], errors="coerce").notna().sum()) if STOCK_COL in lib.columns else 0
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Composants dans la lib", len(lib))
+    k2.metric("Avec un stock renseigné", nb_stock)
+    k3.metric("Pièces en stock (total)",
+              int(pd.to_numeric(lib[STOCK_COL], errors="coerce").sum()) if STOCK_COL in lib.columns else 0)
+
+    st.subheader("Stock personnel")
+    source = st.selectbox("Comment ajouter du stock ?", SOURCES, key="stock_source")
+    if source == "Saisie manuelle":
+        _stock_manual_block()
+    else:
+        _stock_import_block(source)
+
+    st.divider()
+
+    with st.expander("💰 Mettre à jour les prix et stocks LCSC (site)"):
+        st.caption("Interroge LCSC.com pour chaque composant de la librairie (1 requête/seconde). "
+                   "Peut prendre plusieurs minutes selon la taille de la librairie.")
+        if st.button("Lancer la mise à jour des prix"):
+            with st.spinner("Récupération des prix sur LCSC..."):
+                try:
+                    Update_Price_Stock(str(st.session_state.lib_path))
+                    st.session_state.lib = pd.read_excel(st.session_state.lib_path)
+                    st.session_state.stock_msg = "Prix et stocks LCSC mis à jour."
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erreur pendant la mise à jour : {e}")
+
+    st.download_button(
+        "⬇️ Télécharger la librairie mise à jour (.xlsx)",
+        data=Path(st.session_state.lib_path).read_bytes(),
+        file_name=Path(st.session_state.lib_path).name, mime=XLSX_MIME,
+        help="Contient le stock personnel, les prix à jour et la feuille « Historique stock ». "
+             "Remplace ton fichier de librairie par celui-ci.",
+    )
+
+
+# ============================================================
+# Affichage de l'onglet sélectionné
+# ============================================================
+
+if _is_locked(selected):
+    lock_card(missing_for_bom_tabs())
+elif selected == "results":
+    tab_results()
+elif selected == "components":
+    tab_components()
+elif selected == "report":
+    tab_report()
+else:
+    tab_library()

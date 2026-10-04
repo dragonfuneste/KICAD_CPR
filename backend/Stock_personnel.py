@@ -217,13 +217,8 @@ def already_imported(lib_path, source_names) -> dict:
     return found
 
 
-def apply_stock_import(lib_path, plan: pd.DataFrame, add_missing: bool = False) -> int:
-    """
-    Ajoute les quantités du plan dans "Stock Personnel" (crée la colonne si
-    besoin), journalise dans la feuille "Historique stock".
-    Si add_missing, les composants introuvables sont ajoutés en bas de la lib.
-    Retourne le nombre de lignes de stock modifiées / ajoutées.
-    """
+def _open_for_stock(lib_path):
+    """Ouvre la lib, crée la colonne Stock Personnel et la feuille d'historique si besoin."""
     wb = openpyxl.load_workbook(lib_path)
     ws = _ws(wb)
     heads = _headers(ws)
@@ -232,12 +227,21 @@ def apply_stock_import(lib_path, plan: pd.DataFrame, add_missing: bool = False) 
         col = ws.max_column + 1
         ws.cell(row=1, column=col, value=STOCK_COL)
         heads[STOCK_COL.lower()] = col
-    col_stock = heads[STOCK_COL.lower()]
 
     if HISTORY_SHEET not in wb.sheetnames:
-        hs = wb.create_sheet(HISTORY_SHEET)
-        hs.append(["Date", "Source", "Fournisseur", "Ref", "Composant", "Ligne lib", "Qté ajoutée", "Stock avant", "Stock après"])
-    hs = wb[HISTORY_SHEET]
+        h = wb.create_sheet(HISTORY_SHEET)
+        h.append(["Date", "Source", "Fournisseur", "Ref", "Composant", "Ligne lib", "Qté ajoutée", "Stock avant", "Stock après"])
+    return wb, ws, heads, heads[STOCK_COL.lower()], wb[HISTORY_SHEET]
+
+
+def apply_stock_import(lib_path, plan: pd.DataFrame, add_missing: bool = False) -> int:
+    """
+    Ajoute les quantités du plan dans "Stock Personnel" (crée la colonne si
+    besoin), journalise dans la feuille "Historique stock".
+    Si add_missing, les composants introuvables sont ajoutés en bas de la lib.
+    Retourne le nombre de lignes de stock modifiées / ajoutées.
+    """
+    wb, ws, heads, col_stock, hs = _open_for_stock(lib_path)
 
     # dernière ligne réellement remplie (ws.max_row compte les lignes vides formatées)
     c_name = heads.get("manufacturer ref", 1)
@@ -287,6 +291,36 @@ def apply_stock_import(lib_path, plan: pd.DataFrame, add_missing: bool = False) 
     return count
 
 
+def set_stock_manual(lib_path, lib: pd.DataFrame, new_values: dict) -> int:
+    """
+    Saisie manuelle : écrit un stock ABSOLU pour des lignes de lib.
+    new_values : {index de ligne dans lib (DataFrame) : nouveau stock}
+    Journalise l'écart dans l'historique. Retourne le nombre de lignes modifiées.
+    """
+    wb, ws, heads, col_stock, hs = _open_for_stock(lib_path)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    count = 0
+
+    for idx, new in new_values.items():
+        row = int(idx) + 2
+        cell = ws.cell(row=row, column=col_stock)
+        before = _num(cell.value)
+        new = _num(new)
+        if new == before:
+            continue
+        cell.value = _as_int_if_whole(new)
+
+        ref = lib.loc[idx, "reference_LCSC"] if "reference_LCSC" in lib.columns else None
+        if pd.isna(ref) or not str(ref).strip():
+            ref = lib.loc[idx, "reference_Mouser"] if "reference_Mouser" in lib.columns else ""
+        hs.append([now, "Saisie manuelle", "", "" if pd.isna(ref) else ref, lib.loc[idx, "Manufacturer Ref"], row,
+                   _as_int_if_whole(new - before), _as_int_if_whole(before), _as_int_if_whole(new)])
+        count += 1
+
+    wb.save(lib_path)
+    return count
+
+
 # ============================================================
 # Vérification du stock vs liste de composants des BOM
 # ============================================================
@@ -324,9 +358,10 @@ def build_stock_check(components: pd.DataFrame, lib: pd.DataFrame) -> pd.DataFra
             statut = "OK"
 
         rows.append({
-            "Composant": c["Composant"], "Valeur": c["Valeur"], "Type": c["Type"],
-            "Footprint": c["Footprint"], "Ref LCSC": c["Ref LCSC"], "Ref Mouser": c["Ref Mouser"],
-            "BOM concernées": c["BOM concernées"],
+            "Composant": c["Composant"], "Valeur": c["Valeur"], "Description": c.get("Description", ""),
+            "Type": c["Type"], "Footprint": c["Footprint"],
+            "Ref LCSC": c["Ref LCSC"], "Ref Mouser": c["Ref Mouser"],
+            "BOM concernées": c["BOM concernées"], "Qté par BOM": c.get("Qté par BOM", ""),
             "Besoin": need,
             "Stock perso": None if unknown else _as_int_if_whole(stock),
             "Manquant": None if unknown else _as_int_if_whole(missing),
@@ -341,8 +376,10 @@ def build_stock_check(components: pd.DataFrame, lib: pd.DataFrame) -> pd.DataFra
     return out.sort_values("Statut", key=lambda s: s.map(order), kind="stable").reset_index(drop=True)
 
 
-def export_stock_check_excel(check: pd.DataFrame, output_path):
-    """Feuille 'Stock vs BOM' (tout) + feuille 'A commander' (ce qui manque)."""
+def export_stock_check_excel(check: pd.DataFrame, output_path, per_bom: pd.DataFrame = None):
+    """Feuilles : 'Composants & stock' (tout), 'A commander' (ce qui manque), 'Detail par BOM'."""
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        check.to_excel(writer, sheet_name="Stock vs BOM", index=False)
-        check[check["Manquant"] > 0].to_excel(writer, sheet_name="A commander", index=False)
+        check.to_excel(writer, sheet_name="Composants & stock", index=False)
+        check[check["Manquant"].fillna(0) > 0].to_excel(writer, sheet_name="A commander", index=False)
+        if per_bom is not None:
+            per_bom.to_excel(writer, sheet_name="Detail par BOM", index=False)
