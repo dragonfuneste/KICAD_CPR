@@ -69,6 +69,7 @@ def read_mouser_file(file, source_name: str = "") -> pd.DataFrame:
         "MPN": df[c_mpn] if c_mpn else "",
         "Description": df[c_desc] if c_desc else "",
         "Package": "",
+        "Fabricant": "",
         "Qty": pd.to_numeric(df[c_qty], errors="coerce"),
     })
     out = out[df[c_ref].notna() & out["Qty"].notna() & (out["Qty"] > 0)].copy()
@@ -85,6 +86,7 @@ def read_lcsc_file(file, source_name: str = "") -> pd.DataFrame:
     c_qty = _find_qty_col(df.columns)
     c_desc = _find_col(df.columns, "description")
     c_pkg = _find_col(df.columns, "package")
+    c_maker = _find_col(df.columns, "manufacturer")
     if c_ref is None or c_qty is None:
         raise ValueError("Colonnes 'LCSC Part Number' / 'Quantity' introuvables.")
 
@@ -94,6 +96,7 @@ def read_lcsc_file(file, source_name: str = "") -> pd.DataFrame:
         "MPN": df[c_mpn] if c_mpn else "",
         "Description": df[c_desc] if c_desc else "",
         "Package": df[c_pkg] if c_pkg else "",
+        "Fabricant": df[c_maker] if c_maker else "",
         "Qty": pd.to_numeric(df[c_qty], errors="coerce"),
     })
     out = out[df[c_ref].notna() & out["Qty"].notna() & (out["Qty"] > 0)].copy()
@@ -145,8 +148,6 @@ def plan_stock_import(lib: pd.DataFrame, entries: pd.DataFrame) -> pd.DataFrame:
     """
     by_lcsc, by_mouser = _index(lib, "reference_LCSC"), _index(lib, "reference_Mouser")
     by_mpn = _index(lib, "Manufacturer Ref")
-    for k, v in _index(lib, "Manufacturer Part").items():
-        by_mpn.setdefault(k, []).extend(v)
 
     current = {}
     rows = []
@@ -271,7 +272,7 @@ def apply_stock_import(lib_path, plan: pd.DataFrame, add_missing: bool = False) 
                 "manufacturer ref": p["MPN"] or p["Ref"],
                 "description": p["Description"],
                 "footprint": p["Package"],
-                "manufacturer part": p["MPN"],
+                "manufacturer part": p.get("Fabricant", ""),
                 "reference_lcsc": p["Ref"] if p["Fournisseur"] == "LCSC" else None,
                 "reference_mouser": p["Ref"] if p["Fournisseur"] == "Mouser" else None,
             }
@@ -291,7 +292,7 @@ def apply_stock_import(lib_path, plan: pd.DataFrame, add_missing: bool = False) 
     return count
 
 
-def set_stock_manual(lib_path, lib: pd.DataFrame, new_values: dict) -> int:
+def set_stock_manual(lib_path, lib: pd.DataFrame, new_values: dict, source: str = "Saisie manuelle") -> int:
     """
     Saisie manuelle : écrit un stock ABSOLU pour des lignes de lib.
     new_values : {index de ligne dans lib (DataFrame) : nouveau stock}
@@ -313,7 +314,7 @@ def set_stock_manual(lib_path, lib: pd.DataFrame, new_values: dict) -> int:
         ref = lib.loc[idx, "reference_LCSC"] if "reference_LCSC" in lib.columns else None
         if pd.isna(ref) or not str(ref).strip():
             ref = lib.loc[idx, "reference_Mouser"] if "reference_Mouser" in lib.columns else ""
-        hs.append([now, "Saisie manuelle", "", "" if pd.isna(ref) else ref, lib.loc[idx, "Manufacturer Ref"], row,
+        hs.append([now, source, "", "" if pd.isna(ref) else ref, lib.loc[idx, "Manufacturer Ref"], row,
                    _as_int_if_whole(new - before), _as_int_if_whole(before), _as_int_if_whole(new)])
         count += 1
 
@@ -383,3 +384,59 @@ def export_stock_check_excel(check: pd.DataFrame, output_path, per_bom: pd.DataF
         check[check["Manquant"].fillna(0) > 0].to_excel(writer, sheet_name="A commander", index=False)
         if per_bom is not None:
             per_bom.to_excel(writer, sheet_name="Detail par BOM", index=False)
+
+
+# ============================================================
+# Production : "j'ai fabriqué n PCB" -> on retire les pièces du stock
+# ============================================================
+
+def production_check(bom: pd.DataFrame, lib: pd.DataFrame, bom_name: str, n_built: int) -> pd.DataFrame:
+    """Besoin / stock par composant pour fabriquer n_built PCB de la BOM `bom_name`."""
+    from backend.BOM_components import build_component_list
+
+    sub = bom[bom["BOM"] == bom_name].copy()
+    sub["N_PCB"] = int(n_built)
+    comps, _ = build_component_list(sub, lib)
+    return build_stock_check(comps, lib)
+
+
+def max_buildable(bom: pd.DataFrame, lib: pd.DataFrame, bom_name: str) -> dict:
+    """
+    Combien de PCB de cette BOM le stock actuel permet de faire (indépendamment des autres BOM)
+    et quel composant limite. Seuls les composants retrouvés dans la lib sont comptés.
+    """
+    chk = production_check(bom, lib, bom_name, 1)
+    tracked = chk[chk["Ligne lib (Excel)"].notna() & (chk["Besoin"] > 0)]
+    unverified = len(chk) - len(tracked)
+    if tracked.empty:
+        return {"n": None, "limiting": "", "unverified": unverified}
+
+    ratio = (tracked["Stock perso"].astype(float) // tracked["Besoin"].astype(float)).astype(int)
+    i = ratio.idxmin()
+    limiting = tracked.loc[i, "Composant"] or tracked.loc[i, "Valeur"]
+    return {"n": int(ratio.min()), "limiting": limiting, "unverified": unverified}
+
+
+def production_deductions(check: pd.DataFrame):
+    """
+    Sépare les lignes qu'on peut déduire du stock (retrouvées dans la lib) des autres.
+    Retourne (deduct, skipped). deduct a : Composant, Valeur, Ref LCSC, Besoin, Stock avant,
+    Stock après, Statut (OK / INSUFFISANT), lib_idx.
+    """
+    ok_mask = check["Ligne lib (Excel)"].notna() & (check["Statut"] != "NON IDENTIFIÉ")
+    deduct = check[ok_mask].copy()
+    skipped = check[~ok_mask].copy()
+
+    deduct["lib_idx"] = deduct["Ligne lib (Excel)"].astype(int) - 2
+    deduct["Stock avant"] = deduct["Stock perso"].astype(float)
+    deduct["Stock après"] = (deduct["Stock avant"] - deduct["Besoin"]).clip(lower=0)
+    deduct["Statut"] = (deduct["Stock avant"] >= deduct["Besoin"]).map({True: "OK", False: "INSUFFISANT"})
+    cols = ["Composant", "Valeur", "Ref LCSC", "Besoin", "Stock avant", "Stock après", "Statut", "lib_idx"]
+    return deduct[cols].reset_index(drop=True), skipped.reset_index(drop=True)
+
+
+def apply_production(lib_path, lib: pd.DataFrame, deduct: pd.DataFrame, label: str) -> int:
+    """Retire les quantités du stock (jamais en dessous de 0) et journalise avec `label`."""
+    g = deduct.groupby("lib_idx").agg(need=("Besoin", "sum"), stock=("Stock avant", "first"))
+    new_values = {int(idx): max(r["stock"] - r["need"], 0) for idx, r in g.iterrows()}
+    return set_stock_manual(lib_path, lib, new_values, source=label)

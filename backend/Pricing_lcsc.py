@@ -168,3 +168,52 @@ def Update_Price_Stock(name,nom_feuille = "Feuille 1"):
         time.sleep(1)
 
     wb.save(name)
+
+
+def get_lcsc_product_info(product_code):
+    """
+    Pré-remplissage d'un composant à partir de sa page LCSC : réf fabricant, fabricant,
+    package, description, + prix (EUR) et stock.
+
+    Prix et stock utilisent la fonction ci-dessus (éprouvée). Les autres champs sont lus
+    "au mieux" dans les données JSON de la page : si LCSC change sa page, ils seront simplement
+    absents du résultat (clé non présente) sans faire échouer le reste.
+    Retourne None si la page est inaccessible.
+    """
+    product_code = str(product_code).strip()
+    price_info = get_lcsc_price_from_page(product_code, 1)
+
+    info = {}
+    try:
+        html = requests.get(f"https://www.lcsc.com/product-detail/{product_code}.html",
+                            headers=HEADERS_NAVIGATEUR, timeout=15).text
+    except requests.exceptions.RequestException:
+        html = ""
+
+    def grab(*keys):
+        for key in keys:
+            m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % key, html)
+            if m:
+                try:
+                    value = json.loads('"' + m.group(1) + '"')
+                except json.JSONDecodeError:
+                    value = m.group(1)
+                if value.strip():
+                    return value.strip()
+        return None
+
+    for field, keys in {
+        "mpn": ("productModel", "productModelEn"),
+        "manufacturer": ("brandNameEn", "brandName"),
+        "package": ("encapStandard",),
+        "description": ("productIntroEn", "productDescEn"),
+    }.items():
+        value = grab(*keys)
+        if value:
+            info[field] = value
+
+    if price_info:
+        info["price"] = price_info.get("prix_unitaire_eur")
+        info["stock"] = price_info.get("stock")
+
+    return info or None
