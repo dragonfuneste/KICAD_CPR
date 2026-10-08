@@ -7,7 +7,7 @@ Statut unifié d'une ligne de BOM (pastilles de couleur) + validation du composa
   🔵 mouser    : le composant de la lib n'a qu'une réf Mouser (pas de LCSC)
   🟠 mismatch  : la réf LCSC du BOM diffère de celle de la lib (une seule proposition)
                  -> peut être validé : le BOM adopte la réf LCSC de la lib
-  🔴 bad       : non détecté / plusieurs candiddddats / absent de la lib / erreur
+  🔴 bad       : ndddon détecté / plusieurs candiddddats / absent de la lib / erreur
   🟢 validated : ligne validée par l'utilisateur
 """
 
