@@ -24,6 +24,7 @@ from backend.BOM_function import fill_bom_result, check_bom, _add_comment
 from backend.Pricing_lcsc import Update_Price_Stock, get_lcsc_price_from_page, get_lcsc_product_info
 from backend.BOM_report import build_bom_report, export_report_excel, _get_quantity_column
 from backend.BOM_components import build_component_list
+from backend.BOM_validate import row_status, can_validate, validate_row, revert_row
 from backend.Stock_personnel import (
     STOCK_COL, read_mouser_file, read_lcsc_file, plan_stock_import, apply_stock_import,
     set_stock_manual, already_imported, build_stock_check, export_stock_check_excel,
@@ -98,21 +99,10 @@ def _norm(x) -> str:
     return "" if pd.isna(x) else str(x).strip().lower()
 
 
-def _status_for_display(row: pd.Series) -> str:
-    """Statut simple pour un aperçu rapide ligne par ligne."""
-    lcsc = row.get("LCSC_part_number")
-    comments = str(row.get("Comments", "")) if pd.notna(row.get("Comments")) else ""
-
-    if comments:
-        return "⚠️ " + comments
-    if pd.isna(lcsc) or str(lcsc).strip() == "":
-        return "❌ Non détecté"
-    return "✅ OK"
-
-
 def describe_match(result) -> dict:
     """Résume le(s) composant(s) trouvé(s) dans la lib pour une ligne de BOM."""
-    vide = {"Nb_matches": 0, "Lib_Manufacturer_Ref": "", "Lib_Value": "", "Lib_Footprint": "", "Lib_LCSC": ""}
+    vide = {"Nb_matches": 0, "Lib_Manufacturer_Ref": "", "Lib_Value": "", "Lib_Footprint": "", "Lib_LCSC": "",
+            "Lib_idx": None}
     if result is None or result.empty:
         return vide
 
@@ -131,29 +121,8 @@ def describe_match(result) -> dict:
         "Lib_Value": _join("Value"),
         "Lib_Footprint": _join("Footprint"),
         "Lib_LCSC": _join("reference_LCSC"),
+        "Lib_idx": result.index[0] if len(result) == 1 else None,   # sert à valider la proposition
     }
-
-
-def match_verdict(row) -> str:
-    n = row.get("Nb_matches", 0)
-    if n == 0:
-        return "❌ Aucun"
-    if n > 1:
-        return f"❓ {n} candidats"
-    if _norm(row.get("Manufacturer Ref")) == _norm(row.get("Lib_Manufacturer_Ref")):
-        return "✅ Identique"
-    return "🔶 Réf différente"
-
-
-def _color_match(val):
-    if isinstance(val, str):
-        if val.startswith("✅"):
-            return "background-color: #d4edda; color: #1b4332"
-        if val.startswith(("🔶", "❓")):
-            return "background-color: #fff3cd; color: #664d03"
-        if val.startswith("❌"):
-            return "background-color: #f8d7da; color: #58151c"
-    return ""
 
 
 def _color_stock(val):
@@ -173,8 +142,11 @@ def _prepare_bom_frame(raw: pd.DataFrame, i: int) -> pd.DataFrame:
         raw["LCSC_part_number"] = pd.NA
     if "Comments" not in raw.columns:
         raw["Comments"] = pd.NA
-    raw["LCSC_part_number"] = raw["LCSC_part_number"].astype("object")
-    raw["Comments"] = raw["Comments"].astype("object")
+    for col in ("Manufacturer Ref", "Manufacturer"):
+        if col not in raw.columns:
+            raw[col] = pd.NA
+    for col in ("LCSC_part_number", "Comments", "Manufacturer Ref", "Manufacturer"):
+        raw[col] = raw[col].astype("object")
     raw["BOM_id"] = i
     return raw
 
@@ -339,7 +311,7 @@ _defaults = {
     "workdir": None, "bom_raw": None, "bom": None, "bom_signature": None,
     "lib_path": None, "lib_key": None, "lib": None,
     "matches": None, "pending": {}, "nav": "stock",
-    "lib_version": 0, "search_lib_version": None,
+    "lib_version": 0, "search_lib_version": None, "validated": {}, "results_ver": 0,
 }
 for _k, _v in _defaults.items():
     if _k not in st.session_state:
@@ -374,6 +346,7 @@ def run_search():
     st.session_state.bom = bom
     st.session_state.matches = pd.DataFrame.from_dict(matches, orient="index")
     st.session_state.pending = pending
+    st.session_state.validated = {}
     st.session_state.auto_open_dialog = bool(pending)
     st.session_state.search_lib_version = st.session_state.lib_version
     st.session_state.nav = "results"
@@ -470,6 +443,7 @@ with st.container(border=True):
             st.session_state.bom_signature = signature
             st.session_state.matches = None
             st.session_state.pending = {}
+            st.session_state.validated = {}
 
         # Nom / nb de PCB modifiables à tout moment sans perdre la recherche
         names = {i: b["name"] for i, b in enumerate(bom_settings)}
@@ -483,6 +457,7 @@ with st.container(border=True):
         for key in ("bom_raw", "bom", "bom_signature", "matches"):
             st.session_state[key] = None
         st.session_state.pending = {}
+        st.session_state.validated = {}
 
     has_bom = st.session_state.bom_raw is not None
     searched = has_bom and st.session_state.matches is not None
@@ -580,42 +555,93 @@ def missing_for_bom_tabs() -> list:
 # ONGLET : Résultats BOM
 # ============================================================
 
+def _validate(index):
+    """Le BOM adopte le composant proposé par la lib pour cette ligne."""
+    bom, matches, lib = st.session_state.bom, st.session_state.matches, st.session_state.lib
+    st.session_state.validated[index] = validate_row(bom, lib, index, matches.loc[index, "Lib_idx"])
+
+
+def _unvalidate(index):
+    revert_row(st.session_state.bom, index, st.session_state.validated.pop(index))
+
+
 def tab_results():
-    bom = st.session_state.bom
-    matches = st.session_state.matches
+    bom, matches = st.session_state.bom, st.session_state.matches
+    validated = st.session_state.validated
 
-    apercu = bom.copy()
-    apercu["Statut"] = apercu.apply(_status_for_display, axis=1)
-    apercu = apercu.join(matches)
-    apercu["Match"] = apercu.apply(match_verdict, axis=1)
+    apercu = bom.join(matches)
+    res = [row_status(r, idx in validated) for idx, r in apercu.iterrows()]
+    apercu["_kind"] = [k for k, _ in res]
+    apercu["Statut"] = [t for _, t in res]
+    apercu["_can"] = [can_validate(k, r) for k, (_, r) in zip(apercu["_kind"], apercu.iterrows())]
+    apercu["Valider"] = apercu["_kind"] == "validated"
 
-    nb_ok = int((apercu["Statut"] == "✅ OK").sum())
-    nb_warn = int(apercu["Statut"].str.startswith("⚠️").sum())
-    nb_ko = int((apercu["Statut"] == "❌ Non détecté").sum())
+    kinds = apercu["_kind"]
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("🟢 OK", int(kinds.isin(["ok", "validated"]).sum()))
+    m2.metric("🟣 Réf différente", int((kinds == "ref").sum()))
+    m3.metric("🔵 Réf Mouser", int((kinds == "mouser").sum()))
+    m4.metric("🟠 À valider", int((kinds == "mismatch").sum()))
+    m5.metric("🔴 Problèmes", int((kinds == "bad").sum()))
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("OK", nb_ok)
-    c2.metric("À vérifier", nb_warn)
-    c3.metric("Non détecté", nb_ko)
+    st.caption(
+        "🟢 OK · 🟣 trouvé mais réf fabricant différente · 🔵 réf Mouser seulement · "
+        "🟠 réf LCSC du BOM ≠ lib · 🔴 problème.  "
+        "Pour 🟣 et 🟠, coche **Valider** : le BOM adopte le composant de la lib et la ligne passe en 🟢 "
+        "(décoche pour annuler)."
+    )
 
-    only_check = st.checkbox("Afficher uniquement les lignes à vérifier")
+    if st.session_state.get("results_note"):
+        st.info(st.session_state.pop("results_note"))
+
+    c_bulk, c_filter = st.columns([2, 1], vertical_alignment="center")
+    n_ref = int(((kinds == "ref") & apercu["_can"]).sum())
+    if n_ref and c_bulk.button(f"✔ Valider les {n_ref} ligne(s) 🟣 d'un coup"):
+        for idx in apercu.index[(kinds == "ref") & apercu["_can"]]:
+            _validate(idx)
+        st.session_state.results_ver += 1
+        st.session_state.results_note = f"{n_ref} ligne(s) validée(s) : le BOM utilise maintenant les réfs de la lib."
+        st.rerun()
+    only_check = c_filter.checkbox("Uniquement les lignes à vérifier")
     if only_check:
-        apercu = apercu[apercu["Match"] != "✅ Identique"]
+        apercu = apercu[~apercu["_kind"].isin(["ok", "validated"])]
 
-    cols = [c for c in [
-        "BOM", "References", "Match",
-        "Manufacturer Ref", "Lib_Manufacturer_Ref",
-        "Value", "Lib_Value",
-        "Footprint", "Lib_Footprint",
-        "LCSC_part_number", "Lib_LCSC",
-        "Nb_matches", "Comments", "Statut",
-    ] if c in apercu.columns]
+    cols = ["Valider", "Statut", "BOM", "References", "Manufacturer Ref", "Lib_Manufacturer_Ref",
+            "Value", "Lib_Value", "Footprint", "Lib_Footprint", "LCSC_part_number", "Lib_LCSC",
+            "Nb_matches", "Comments"]
+    cols = [c for c in cols if c in apercu.columns]
+    view = apercu[cols]
 
-    st.dataframe(apercu[cols].style.map(_color_match, subset=["Match"]), **STRETCH, height=460)
+    edited = st.data_editor(
+        view, hide_index=True, height=480, **STRETCH,
+        key=f"results_editor_{st.session_state.results_ver}_{int(only_check)}",   # reset après chaque validation
+        disabled=[c for c in cols if c != "Valider"],
+        column_config={
+            "Valider": st.column_config.CheckboxColumn("Valider", width="small"),
+            "Statut": st.column_config.TextColumn("Statut", width="medium"),
+        },
+    )
+
+    changed = edited.index[edited["Valider"] != view["Valider"]]
+    if len(changed):
+        refused = 0
+        for idx in changed:
+            if bool(edited.loc[idx, "Valider"]):
+                if apercu.loc[idx, "_can"]:
+                    _validate(idx)
+                else:
+                    refused += 1
+            elif idx in validated:
+                _unvalidate(idx)
+        if refused:
+            st.session_state.results_note = (f"{refused} ligne(s) sans proposition unique à valider : "
+                                             "seules les lignes 🟣 et 🟠 se valident.")
+        st.session_state.results_ver += 1
+        st.rerun()
 
     st.download_button(
         "⬇️ Télécharger le BOM vérifié",
-        data=_df_to_excel_bytes(bom.drop(columns=["BOM_id"], errors="ignore")),
+        data=_df_to_excel_bytes(st.session_state.bom.drop(columns=["BOM_id"], errors="ignore")),
         file_name="bom_verifie.xlsx", mime=XLSX_MIME,
     )
 

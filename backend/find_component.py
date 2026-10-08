@@ -1,8 +1,11 @@
 from rapidfuzz import process, fuzz
 import pandas as pd
 
-def find_by_value(column, library, value, top_n=5, score_gap=10):
+def _find_with_kind(column, library, value, top_n=5, score_gap=10):
     """
+    Comme find_by_value, mais retourne (DataFrame ou None, kind) avec kind dans
+    {"exact", "contains", "fuzzy"} : exact / contains sont fiables, fuzzy ne l'est pas.
+
     Recherche une valeur dans une colonne.
 
     1. Recherche exacte.
@@ -22,7 +25,7 @@ def find_by_value(column, library, value, top_n=5, score_gap=10):
     exact = library[library[column] == value]
 
     if not exact.empty:
-        return exact
+        return exact, "exact"
 
     # ---------------------------------------------------------
     # 2. Recherche de la valeur contenue dans une chaîne
@@ -39,7 +42,7 @@ def find_by_value(column, library, value, top_n=5, score_gap=10):
     ]
 
     if not contains.empty:
-        return contains
+        return contains, "contains"
 
     # ---------------------------------------------------------
     # 3. Recherche floue
@@ -47,7 +50,7 @@ def find_by_value(column, library, value, top_n=5, score_gap=10):
     choices = library.loc[library[column].notna(), column].astype(str).unique().tolist()
 
     if len(choices) == 0:
-        return None
+        return None, "fuzzy"
 
     matches = process.extract(
         value_str,
@@ -83,18 +86,27 @@ def find_by_value(column, library, value, top_n=5, score_gap=10):
     # ---------------------------------------------------------
     result = library[library[column].notna() & col_str.isin(selected_values)].copy()
 
-    return result
+    return result, "fuzzy"
+
+
+def find_by_value(column, library, value, top_n=5, score_gap=10):
+    """Version simple : retourne seulement le DataFrame (ou None)."""
+    return _find_with_kind(column, library, value, top_n, score_gap)[0]
 
 
 def search_in_lib(library, bom_line):
     """
     Recherche un composant en combinant Manufacturer Ref, Footprint, Value.
 
-    Chaque critère est cherché dans la librairie complète. On accumule les
-    critères par intersection SEULEMENT si cela ne vide pas le résultat déjà
-    obtenu : un critère peu fiable (ex: Value générique comme "STM32G070CBTx"
-    ou "WS2812B") ne doit jamais effacer un match exact déjà trouvé par un
-    critère plus spécifique comme Manufacturer Ref.
+    Chaque critère est cherché dans la librairie complète, puis on accumule par intersection
+    SEULEMENT si cela ne vide pas le résultat déjà obtenu.
+
+    Les critères sont traités par fiabilité :
+      1. d'abord ceux qui donnent un match exact ou "contenu" (dans l'ordre Ref, Footprint, Value) ;
+      2. ensuite seulement ceux qui ne donnent qu'un match flou, pour départager.
+    Ainsi une réf fabricant inconnue de la lib (qui ne ramène que du flou sans rapport) n'écrase
+    plus le bon composant trouvé de façon fiable par la valeur / le footprint : la lib "propose"
+    alors le composant qui a la même valeur et le même footprint.
 
     On s'arrête dès qu'un seul composant reste.
     """
@@ -105,7 +117,7 @@ def search_in_lib(library, bom_line):
         ("Value", "Value"),
     ]
 
-    result = None
+    reliable, fuzzy = [], []
 
     for bom_column, lib_column in criteres:
 
@@ -117,10 +129,16 @@ def search_in_lib(library, bom_line):
         if pd.isna(value) or str(value).strip() == "":
             continue
 
-        candidate = find_by_value(lib_column, library, value)
+        candidate, kind = _find_with_kind(lib_column, library, value)
 
         if candidate is None or candidate.empty:
             continue
+
+        (fuzzy if kind == "fuzzy" else reliable).append(candidate)
+
+    result = None
+
+    for candidate in reliable + fuzzy:
 
         if result is None:
             result = candidate
