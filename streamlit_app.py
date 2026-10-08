@@ -24,7 +24,7 @@ from backend.BOM_function import fill_bom_result, check_bom, _add_comment
 from backend.Pricing_lcsc import Update_Price_Stock, get_lcsc_price_from_page, get_lcsc_product_info
 from backend.BOM_report import build_bom_report, export_report_excel, _get_quantity_column
 from backend.BOM_components import build_component_list
-from backend.Bom_validate import row_status, can_validate, validate_row, revert_row
+from backend.BOM_validate import row_status, can_validate, validate_row, revert_row
 from backend.Stock_personnel import (
     STOCK_COL, read_mouser_file, read_lcsc_file, plan_stock_import, apply_stock_import,
     set_stock_manual, already_imported, build_stock_check, export_stock_check_excel,
